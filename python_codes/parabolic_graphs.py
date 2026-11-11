@@ -1,0 +1,502 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from pathlib import Path
+# ============================================================
+# GLOBAL FONT SETTINGS
+# ============================================================
+FONTSIZE = 16
+FONTNAME = "Times New Roman"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+OUTPUT_DIR = REPO_ROOT
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR = OUTPUT_DIR / "figs" / "fig_parabola"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+plt.rcParams.update({
+    "font.size": FONTSIZE,
+    "font.family": FONTNAME,
+    "axes.titlesize": FONTSIZE,
+    "axes.labelsize": FONTSIZE,
+    "xtick.labelsize": FONTSIZE,
+    "ytick.labelsize": FONTSIZE,
+    "legend.fontsize": FONTSIZE,
+})
+
+# ============================================
+# USER ROOTS
+# ============================================
+alpha1, alpha2 = 3.0, 4.0  # user parabola roots
+
+# ============================================
+# ATTACKER ROOTS (ATTACKER LEFT + OVERLAP)
+# beta1 < alpha1 < beta2 < alpha2
+# ============================================
+attacker_roots = [
+    (2.0, 3.5),
+    (1.2, 3.5),
+    (0.6, 3.5)
+]
+
+beta1 = attacker_roots[0][0]  # constant beta1
+labels = ["(a)", "(b)", "(c)"]
+
+# ============================================
+# PDF FUNCTIONS
+# ============================================
+def user_pdf(x):
+    a = 6 / (alpha1 - alpha2)**3
+    b = -6 * (alpha1 + alpha2) / (alpha1 - alpha2)**3
+    c = 6 * alpha1 * alpha2 / (alpha1 - alpha2)**3
+    y = a * x**2 + b * x + c
+    y[(x < alpha1) | (x > alpha2)] = 0
+    return y
+
+def attacker_pdf(x, b1, b2):
+    d = 6 / (b1 - b2)**3
+    e = -6 * (b1 + b2) / (b1 - b2)**3
+    f = 6 * b1 * b2 / (b1 - b2)**3
+    y = d * x**2 + e * x + f
+    y[(x < b1) | (x > b2)] = 0
+    return y
+
+# ============================================
+# FAR / FRR — ATTACKER LEFT (CANONICAL)
+# ============================================
+def compute_far_frr(x, PU, PA, b1, b2):
+    dx = x[1] - x[0]
+
+    # cumulative integrals
+    PA_cum = np.cumsum(PA) * dx
+    PU_cum = np.cumsum(PU) * dx
+
+    # indices for bounds
+    idx_b1 = np.argmin(np.abs(x - b1))
+    idx_b2 = np.argmin(np.abs(x - b2))
+    idx_a1 = np.argmin(np.abs(x - alpha1))
+    idx_a2 = np.argmin(np.abs(x - alpha2))
+
+    # total mass (should be 1, but use numeric total for robustness)
+    total_A = PA_cum[idx_b2] - (PA_cum[idx_b1-1] if idx_b1 > 0 else 0.0)
+    total_U = PU_cum[idx_a2] - (PU_cum[idx_a1-1] if idx_a1 > 0 else 0.0)
+
+    def FAR(T):
+        T = np.atleast_1d(T)
+        out = np.zeros_like(T, dtype=float)
+        for i, t in enumerate(T):
+            if t <= b1:
+                out[i] = 1.0
+            elif t >= b2:
+                out[i] = 0.0
+            else:
+                idx = np.argmin(np.abs(x - t))
+                num = PA_cum[idx_b2] - PA_cum[idx]
+                out[i] = num / total_A
+        return out
+
+    def FRR(T):
+        T = np.atleast_1d(T)
+        out = np.zeros_like(T, dtype=float)
+        for i, t in enumerate(T):
+            if t <= alpha1:
+                out[i] = 0.0
+            elif t >= alpha2:
+                out[i] = 1.0
+            else:
+                idx = np.argmin(np.abs(x - t))
+                num = PU_cum[idx] - PU_cum[idx_a1]
+                out[i] = num / total_U
+        return out
+
+    return FAR, FRR
+
+# ============================================
+# SIMPLIFIED Y-AXIS HANDLER
+# ============================================
+def remove_y_ticks(ax):
+    ax.set_yticks([0])
+    ax.set_yticklabels(["0"])
+
+def set_symbolic_ticks(ax, b1, b2):
+    # attacker-left ordering: beta1 < alpha1 < beta2 < alpha2
+    ax.set_xticks([0, b1, alpha1, b2, alpha2])
+    ax.set_xticklabels([
+        "0",
+        r"$\beta_1$",
+        r"$\alpha_1$",
+        r"$\beta_2$",
+        r"$\alpha_2$"
+    ])
+    ax.set_yticks([0])
+    ax.set_yticklabels(["0"])
+
+# ============================================
+# DOMAIN
+# ============================================
+x = np.linspace(0, 5.0, 500)
+PU = user_pdf(x)
+
+# ============================================
+# PLOT 1 — Parabola_figure.pdf
+# ============================================
+b1_plot, b2_plot = attacker_roots[0]
+PA = attacker_pdf(x, b1_plot, b2_plot)
+np.savetxt(
+    DATA_DIR / "parabola_graphs.txt",
+    np.column_stack([x, PU, PA]),
+    header="s PU PA",
+    comments="",
+    fmt="%.10f"
+)
+fig1, ax1 = plt.subplots(figsize=(10, 4))
+ax1.plot(x, PU, color="blue", linewidth=2, label=r"$P_U(s)$")
+ax1.plot(x, PA, color="red",  linewidth=2, label=r"$P_A(s)$")
+
+ax1.axhline(0, color="black")
+ax1.legend()
+
+set_symbolic_ticks(ax1, b1_plot, b2_plot)
+remove_y_ticks(ax1)
+
+ax1.set_xlabel(r"$s$")
+ax1.set_ylabel(r"$P(s)$")
+
+ax1.grid(axis='y', linestyle=":")
+
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR / "figs" / "fig_parabola" / "Parabola_figure.pdf", format="pdf")
+
+
+# ============================================================
+# PLOT 2A — PDFs
+# ============================================================
+fig2A, axes2A = plt.subplots(1, 3, figsize=(24, 8))
+
+for col, (b1, b2) in enumerate(attacker_roots):
+    PA = attacker_pdf(x, b1, b2)
+    ax = axes2A[col]
+
+    ax.plot(x, PU, color="blue", linewidth=2,label =r"$P_U(s)$")
+    ax.plot(x, PA, color="red", linewidth=2, label =r"$P_A(s)$")
+
+    ax.legend()
+    set_symbolic_ticks(ax, b1, b2)
+    remove_y_ticks(ax)
+
+    ax.set_xlabel(r"$s$")
+    ax.set_ylabel(r"$P(s)$")
+
+    ax.text(0.5, -0.28, labels[col],
+            transform=ax.transAxes, fontweight="bold",
+            ha="center", va="top")
+
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR / "figs" / "fig_parabola" / "fig_distributions_parabola.pdf", format="pdf")
+
+
+# ============================================================
+# PLOT 2B — P_success (from FAR/FRR, attacker-left)
+# ============================================================
+fig2B, axes2B = plt.subplots(1, 3, figsize=(24, 8))
+
+for col, (b1, b2) in enumerate(attacker_roots):
+    PA = attacker_pdf(x, b1, b2)
+    FAR, FRR = compute_far_frr(x, PU, PA, b1, b2)
+
+    far_vals = FAR(x)
+    frr_vals = FRR(x)
+
+    # P_success(T) = 1 - FAR - FRR + FAR*FRR
+    Ps = 1.0 - far_vals - frr_vals + far_vals * frr_vals
+
+    idx_opt = np.argmax(Ps)
+    T_opt = x[idx_opt]
+    Ps_opt = Ps[idx_opt]
+
+    diff = np.abs(far_vals - frr_vals)
+    idx_eer = np.argmin(diff)
+    T_eer = x[idx_eer]
+    Ps_eer = Ps[idx_eer]
+
+    ax = axes2B[col]
+    ax.plot(x, Ps, color="black", linewidth=2, label="Success Curve")
+
+    ax.scatter([T_opt], [Ps_opt], color="blue", label=r"$P_{\text{success}}(T_{opt})$")
+    ax.annotate("Optimal",
+                xy=(T_opt, Ps_opt),
+                xytext=(T_opt - 0.5, Ps_opt),
+                fontsize=12, color="blue")
+
+    ax.scatter([T_eer], [Ps_eer], color="red",label=r"$P_{\text{success}}(T_{eer})$")
+    ax.annotate("EER",
+                xy=(T_eer, Ps_eer),
+                xytext=(T_eer + 0.3, Ps_eer),
+                ha="right",
+                fontsize=12, color="red")
+
+    ax.legend()
+    set_symbolic_ticks(ax, b1, b2)
+    remove_y_ticks(ax)
+
+    ax.set_xlabel(r"$T$")
+    ax.set_ylabel(r"$P_{\text{success}}(T)$")
+
+    ax.text(0.5, -0.28, labels[col],
+            transform=ax.transAxes, fontweight="bold",
+            ha="center", va="top")
+
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR / "figs" / "fig_parabola" / "fig_psuccess_parabola.pdf", format="pdf")
+
+case_names = ["a", "b", "c"]
+
+# ============================================
+# PLOT 3 — FAR vs FRR
+# ============================================
+fig3, axes3 = plt.subplots(1, 3, figsize=(24, 8))
+
+for col, (b1, b2) in enumerate(attacker_roots):
+    case = case_names[col]
+    PA = attacker_pdf(x, b1, b2)
+    FAR, FRR = compute_far_frr(x, PU, PA, b1, b2)
+
+    far_vals = FAR(x)
+    frr_vals = FRR(x)
+
+    # success for optimal point
+    Ps = 1.0 - far_vals - frr_vals + far_vals * frr_vals
+    idx_opt = np.argmax(Ps)
+    T_opt = x[idx_opt]
+    far_opt = FAR(T_opt)[0]
+    frr_opt = FRR(T_opt)[0]
+
+    diff = np.abs(frr_vals - far_vals)
+    idx_eer = np.argmin(diff)
+    eer = far_vals[idx_eer]
+    T_eer = x[idx_eer]
+    Ps_eer = Ps[idx_eer]
+    far_eer = far_vals[idx_eer]
+    frr_eer = frr_vals[idx_eer]
+    Ps_opt = Ps[idx_opt] 
+    DATA_FILE = OUTPUT_DIR / "figs" / "fig_parabola" / f"parabola_case_{case}.txt"
+    POINTS_FILE = OUTPUT_DIR / "figs" / "fig_parabola" / f"parabola_case_{case}_points.txt"
+
+    DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(DATA_FILE, "w") as f:
+        f.write("s PU PA FAR FRR Ps\n")
+        for xi, pu, pa, far, frr, ps in zip(x, PU, PA, far_vals, frr_vals, Ps):
+            f.write(
+                f"{xi:.4f} {pu:.4f} {pa:.4f} "
+                f"{far:.4f} {frr:.4f} {ps:.4f}\n"
+            )
+
+    with open(POINTS_FILE, "w") as f:
+        f.write("T_opt Ps_opt T_eer Ps_eer FRR_opt FAR_opt FRR_eer FAR_eer\n")
+        f.write(
+            f"{T_opt:.4f} {Ps_opt:.4f} "
+            f"{T_eer:.4f} {Ps_eer:.4f} "
+            f"{frr_opt:.4f} {far_opt:.4f} "
+            f"{frr_eer:.4f} {far_eer:.4f}\n"
+        )
+
+    ax = axes3[col]
+    ax.plot(frr_vals, far_vals, color="purple", linewidth=2, label="Operating Curve")
+
+    ax.scatter([frr_opt], [far_opt], color="blue", label="Optimal Point")
+    ax.annotate("Optimal",
+                xy=(frr_opt, far_opt),
+                xytext=(frr_opt + 0.015, far_opt + 0.015),
+                fontsize=12, color="blue")
+
+    ax.scatter([eer], [eer], color="red", label="EER Point")
+    ax.annotate("EER",
+                xy=(eer, eer),
+                xytext=(eer + 0.015, eer),
+                fontsize=12, color="red")
+
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+
+    # No numbers
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.legend()
+    ax.set_xlabel("FRR(T)")
+    ax.set_ylabel("FAR(T)")
+
+    ax.grid(axis='y', linestyle=":")
+
+    ax.text(0.5, -0.28, labels[col],
+            transform=ax.transAxes, fontweight="bold",
+            ha="center", va="top")
+
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR / "figs" / "fig_parabola" / "fig_FARvFRR_parabola.pdf", format="pdf")
+
+
+# ============================================
+# PLOT 4 — Gap between EER and Optimal vs Variance
+# ============================================
+
+# Sweep attacker beta2 values to vary shape, while keeping:
+# beta1 < alpha1 < beta2 < alpha2
+beta1_sweep = np.linspace(0.5, 2.5, 120)  # all between 1 and 2
+
+variances = []
+gaps = []
+Pmax_values = []
+PEER_values = []
+beta2 = attacker_roots[0][1]
+for beta1 in beta1_sweep:
+    PA = attacker_pdf(x, beta1, beta2)
+
+    # variance of attacker
+    EX  = np.trapezoid(x * PA, x)
+    EX2 = np.trapezoid((x**2) * PA, x)
+    variance = EX2 - EX**2
+    variances.append(variance)
+
+    FAR, FRR = compute_far_frr(x, PU, PA, beta1, beta2)
+    far_vals = FAR(x)
+    frr_vals = FRR(x)
+
+    Ps = 1.0 - far_vals - frr_vals + far_vals * frr_vals
+
+    # Optimal T
+    idx_opt = np.argmax(Ps)
+    T_opt = x[idx_opt]
+
+    # EER T
+    diff = np.abs(far_vals - frr_vals)
+    idx_eer = np.argmin(diff)
+    T_eer = x[idx_eer]
+    Pmax = Ps[idx_opt]
+    PEER = Ps[idx_eer]
+    gaps.append(abs(T_opt - T_eer))
+    Pmax_values.append(Pmax)
+    PEER_values.append(PEER)
+
+variances = np.array(variances)
+gaps = np.array(gaps)
+Pmax_values = np.array(Pmax_values)
+PEER_values = np.array(PEER_values)
+GAP_VAR_DATA = OUTPUT_DIR / "figs" / "fig_parabola" / "gap_vs_variance_parabola.txt"
+GAP_VAR_DATA.parent.mkdir(parents=True, exist_ok=True)
+
+
+with open(GAP_VAR_DATA, "w") as f:
+    f.write("variance gap Pmax PEER\n")
+    for var, gap, pmax, peer in zip(
+        variances,
+        gaps,
+        Pmax_values,
+        PEER_values
+    ):
+        f.write(f"{var:.4f} {gap:.4f} {pmax:.4f} {peer:.4f}\n")
+
+fig_gap, ax_gap = plt.subplots(figsize=(10, 6))
+
+ax_gap.plot(variances, gaps, color="purple", linewidth=2)
+ax_gap.set_xlabel(r"Attacker Variance $\mathrm{Var}(s)$")
+ax_gap.set_ylabel(r"$|T_{\text{opt}} - T_{\text{EER}}|$")
+ax_gap.grid(True, linestyle=":")
+
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR / "figs" / "fig_parabola" / "fig_gap_vs_variance_parabola.pdf", format="pdf")
+# ============================================================
+# EXPORT QUADRATIC PDF DATA + GENERATE TIKZ TEMPLATE
+# ============================================================
+
+def quadratic_pdf_from_roots(x, r1, r2):
+    """
+    Normalized quadratic PDF supported on [r1, r2].
+    The curve is zero at r1 and r2 and positive inside.
+    """
+    a = 6 / (r1 - r2) ** 3
+    b = -6 * (r1 + r2) / (r1 - r2) ** 3
+    c = 6 * r1 * r2 / (r1 - r2) ** 3
+
+    y = a * x**2 + b * x + c
+    y[(x < r1) | (x > r2)] = 0
+    return y
+
+
+def generate_quadratic_pdf_documents():
+    """
+    Generates one data file for the three quadratic PDF cases:
+
+        figs/fig_parabola/quadratic_three_cases.txt
+
+    Columns:
+        s PU_case1 PA_case1 PU_case2 PA_case2 PU_case3 PA_case3
+
+    Cases:
+        case 1: separated distributions
+        case 2: attacker range lies inside the user range
+        case 3: partial overlap
+    """
+
+    x = np.linspace(0, 1.0, 1000)
+
+    # ------------------------------------------------------------
+    # Case 1: separated quadratic PDFs
+    # attacker is left of user
+    # a1 < a2 < u1 < u2
+    # ------------------------------------------------------------
+    a1_case1, a2_case1 = 0.15, 0.40
+    u1_case1, u2_case1 = 0.60, 0.85
+
+    PA_case1 = quadratic_pdf_from_roots(x, a1_case1, a2_case1)
+    PU_case1 = quadratic_pdf_from_roots(x, u1_case1, u2_case1)
+
+    # ------------------------------------------------------------
+    # Case 2: attacker range lies inside the user range
+    # u1 < a1 < a2 < u2
+    # ------------------------------------------------------------
+    u1_case2, u2_case2 = 0.20, 0.85
+    a1_case2, a2_case2 = 0.40, 0.65
+
+    PU_case2 = quadratic_pdf_from_roots(x, u1_case2, u2_case2)
+    PA_case2 = quadratic_pdf_from_roots(x, a1_case2, a2_case2)
+
+    # ------------------------------------------------------------
+    # Case 3: partial overlap
+    # a1 < u1 < a2 < u2
+    # ------------------------------------------------------------
+    a1_case3, a2_case3 = 0.15, 0.65
+    u1_case3, u2_case3 = 0.40, 0.85
+
+    PA_case3 = quadratic_pdf_from_roots(x, a1_case3, a2_case3)
+    PU_case3 = quadratic_pdf_from_roots(x, u1_case3, u2_case3)
+
+    out_file = DATA_DIR / "quadratic_three_cases.txt"
+
+    np.savetxt(
+        out_file,
+        np.column_stack([
+            x,
+            PU_case1, PA_case1,
+            PU_case2, PA_case2,
+            PU_case3, PA_case3,
+        ]),
+        header=(
+            "s "
+            "PU_case1 PA_case1 "
+            "PU_case2 PA_case2 "
+            "PU_case3 PA_case3"
+        ),
+        comments="",
+        fmt="%.10f"
+    )
+
+    print(f"Saved: {out_file}")
+
+# Run this after all your plots are generated
+
+generate_quadratic_pdf_documents()
+print("Saved all parabolic figures:")
+print("  - Parabola_figure.pdf")
+print("  - fig_distributions_parabola.pdf")
+print("  - fig_psuccess_parabola.pdf")
+print("  - fig_FARvFRR_parabola.pdf")
+print("  - fig_gap_vs_variance_parabola.pdf")

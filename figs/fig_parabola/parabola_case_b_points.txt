@@ -1,0 +1,2 @@
+T_opt Ps_opt T_eer Ps_eer FRR_opt FAR_opt FRR_eer FAR_eer
+3.0762 0.8955 3.1463 0.8801 0.0187 0.0874 0.0618 0.0620

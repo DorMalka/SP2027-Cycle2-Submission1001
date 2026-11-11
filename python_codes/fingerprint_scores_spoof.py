@@ -1,0 +1,4877 @@
+import argparse
+import csv
+import hashlib
+import json
+import re
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+
+import numpy as np
+from scipy import stats
+from scipy.ndimage import gaussian_filter1d
+from scipy.optimize import differential_evolution, minimize
+from typing import Dict, List, Tuple
+
+# =========================
+# Config
+# =========================
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SOURCEAFIS_DIR = REPO_ROOT / "sourceafis-demo"
+LIVDET_ROOT = SOURCEAFIS_DIR / "livdet_preproc_png"
+
+# Each LivDet partition is an independent population. Identical numeric IDs in
+# Training and Testing must never be treated as the same fingerprint.
+TRAIN_LIVE_DIR = LIVDET_ROOT / "Training" / "Digital_Persona" / "Live"
+TEST_LIVE_DIR = LIVDET_ROOT / "Testing" / "Digital_Persona" / "Live"
+LIVE_DIRS_BY_SPLIT = {
+    "Training": TRAIN_LIVE_DIR,
+    "Testing": TEST_LIVE_DIR,
+}
+
+# Fake material names to include independently within each partition.
+FAKE_MATERIALS = [
+    "Gelatine",
+    "Woodglue",
+    "Ecoflex",
+    "Latex",
+]
+
+# Multi-user evaluation. Leave USER_IDS as None to evaluate every identity in
+# each partition. To run only a subset while debugging, use values such as
+# ["002_0", "003_0"]; matching IDs are evaluated separately per partition.
+USER_IDS = None
+PROBES_PER_USER = 4
+
+# A filename such as 002_0_5.png belongs to identity 002_0, sample 5.
+LIVDET_FILENAME_PATTERN = re.compile(
+    r"^(?P<identity>\d+_\d+)_(?P<sample>\d+)$"
+)
+
+OUTPUT_DIR = REPO_ROOT
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+SPOOF_OUTPUT_DIR = OUTPUT_DIR / "figs" / "fig_spoofed_users"
+SPOOF_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+SCORES_DIR = SPOOF_OUTPUT_DIR / "sourceafis_livdet_multiuser_raw_scores"
+SCORES_DIR.mkdir(parents=True, exist_ok=True)
+
+AGGREGATED_SCORES_CSV = (
+    SPOOF_OUTPUT_DIR / "sourceafis_livdet_scores_best_of_probes_aggregated.csv"
+)
+
+PDF_FINE_STEP = 0.1
+SMOOTH_SIGMA_POINTS = 3.0
+HISTOGRAM_BIN_WIDTH = 2.5
+HIST_BINS = np.arange(
+    0.0,
+    100.0 + HISTOGRAM_BIN_WIDTH,
+    HISTOGRAM_BIN_WIDTH,
+)
+THEORETICAL_CURVE_STEP = 0.1
+
+# Distribution parameters reported by ks_histogram_test.py for the LivDet
+# histogram used by this script.
+# Uniform parameters are (loc, scale), with support [loc, loc + scale].
+KS_UNIFORM_GENUINE = (1.25, 97.5)
+KS_UNIFORM_IMPOSTOR = (1.25, 77.5)
+
+# Quadratic parameters are scipy.stats.rdist (shape, loc, scale). Shape 4 is
+# the normalized parabolic distribution, with support
+# [loc - scale, loc + scale].
+KS_QUADRATIC_GENUINE = (4.0, 44.3902, 54.6395)
+KS_QUADRATIC_IMPOSTOR = (4.0, 26.4433, 52.3973)
+
+# Normal parameters are (loc, scale) = (mean, standard deviation).
+KS_NORMAL_GENUINE = (35.6369, 19.855)
+KS_NORMAL_IMPOSTOR = (12.6193, 13.7593)
+CDF_DATA_FILE = SPOOF_OUTPUT_DIR / "livdet_sourceafis_empirical_cdf_data.txt"
+
+# The full analysis writes these four sweep dependencies to this checkpoint:
+# thresholds, FARs, FRRs, and the EER threshold. Subsequent sweep-only runs
+# load the checkpoint instead of rerunning SourceAFIS and the biometric analysis.
+SWEEP_INPUTS_FILE = SPOOF_OUTPUT_DIR / "psafe_sweep_inputs.npz"
+SWEEP_RESULTS_CSV = SPOOF_OUTPUT_DIR / "psafe_sweep_results.csv"
+SWEEP_RESULTS_TEX = SPOOF_OUTPUT_DIR / "psafe_sweep_table.tex"
+ATTEMPTS_SUCCESS_DATA = (
+    SPOOF_OUTPUT_DIR / "livdet_attempts_success_function_data.txt"
+)
+FIXED_PREFIX_TIKZ_DATA = (
+    SPOOF_OUTPUT_DIR / "livdet_fixed_prefix_far_frr_success_by_k.txt"
+)
+FIXED_USER_ATTACKER_TIKZ_DATA = (
+    SPOOF_OUTPUT_DIR / "livdet_fixed_user_attacker_success_by_k.txt"
+)
+
+# Atomic-credential families used by sweep_psafe_success. Change these values
+# here when testing a different family while reusing the saved biometric inputs.
+SWEEP_LEAK_CASE_BASE = (0.60, 0.30, 0.05, 0.05)
+SWEEP_LOSS_CASE_BASE = (0.60, 0.05, 0.30, 0.05)
+
+
+# =========================
+# Small path helpers
+# =========================
+def source_tag(p: Path) -> str:
+    """
+    Produce a unique staged filename prefix based on original path.
+    """
+    parts = list(p.parts)
+    try:
+        i = parts.index("livdet_preproc_png")
+        rel = Path(*parts[i + 1:])
+    except ValueError:
+        rel = p.name
+
+    rel_str = str(rel).replace("/", "__").replace("\\", "__").replace(" ", "_")
+    digest = hashlib.md5(str(p).encode("utf-8")).hexdigest()[:8]
+    return f"{rel_str}__{digest}"
+
+
+def stage_files(files, dst_dir: Path):
+    """
+    Stage files into dst_dir with unique names so train/test/fake folders
+    can be merged safely into one candidate directory.
+    Returns:
+        staged_dir, mapping(staged_name -> original_path)
+    """
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    mapping = {}
+
+    for src in files:
+        src = Path(src).resolve()
+        staged_name = f"{source_tag(src)}__{src.name}"
+        dst = dst_dir / staged_name
+        mapping[staged_name] = src
+        try:
+            dst.symlink_to(src)
+        except Exception:
+            shutil.copy2(src, dst)
+
+    return dst_dir, mapping
+
+
+def collect_matching_files(src_dir: Path, pattern: str):
+    src_dir = Path(src_dir)
+    if not src_dir.is_dir():
+        return []
+    return sorted(f.resolve() for f in src_dir.glob(pattern) if f.is_file())
+
+
+def extract_livdet_identity(path: Path):
+    """Return the identity encoded in a filename such as 002_0_5.png."""
+    match = LIVDET_FILENAME_PATTERN.match(Path(path).stem)
+    if match is None:
+        return None
+    return match.group("identity")
+
+
+def identity_sort_key(identity):
+    return tuple(int(part) for part in identity.split("_"))
+
+
+def sample_sort_key(path):
+    match = LIVDET_FILENAME_PATTERN.match(Path(path).stem)
+    if match is None:
+        return float("inf")
+    return int(match.group("sample"))
+
+
+def collect_genuine_candidates(live_dir, identity_glob, probe_paths):
+    """Collect non-probe live samples from the enrollment partition only."""
+    probe_set = {p.resolve() for p in probe_paths}
+
+    candidates = []
+    candidates.extend(collect_matching_files(live_dir, identity_glob))
+
+    # Exclude exact probe files
+    candidates = [p for p in candidates if p.resolve() not in probe_set]
+
+    # Deduplicate while preserving order
+    seen = set()
+    out = []
+    for p in candidates:
+        rp = p.resolve()
+        if rp not in seen:
+            seen.add(rp)
+            out.append(rp)
+    return out
+
+
+def collect_fake_candidates(
+    livdet_root: Path,
+    split: str,
+    materials,
+    identity_glob,
+):
+    """
+    Collect targeted fakes from the same partition as the enrollment images.
+    """
+    candidates = []
+
+    for material in materials:
+        fake_dir = (
+            livdet_root
+            / split
+            / "Digital_Persona"
+            / "Fake"
+            / material
+        )
+        if fake_dir.is_dir():
+            candidates.extend(collect_matching_files(fake_dir, identity_glob))
+
+    # Deduplicate while preserving order
+    seen = set()
+    out = []
+    for p in candidates:
+        rp = p.resolve()
+        if rp not in seen:
+            seen.add(rp)
+            out.append(rp)
+    return out
+
+
+def select_users_and_files():
+    """
+    Build independent enrollment experiments inside Training and Testing.
+
+    For every (partition, identity) pair:
+      - the first PROBES_PER_USER live images are enrollment probes;
+      - the remaining live images in that partition are genuine candidates;
+      - matching fake images from that same partition are spoof candidates;
+      - genuine candidates are retained even when no matching fakes exist.
+
+    Results from both partitions are pooled only after their within-partition
+    comparisons have been scored.
+    """
+    selections = {}
+
+    for split, live_dir in LIVE_DIRS_BY_SPLIT.items():
+        if not live_dir.is_dir():
+            raise FileNotFoundError(
+                f"{split} live directory not found: {live_dir}"
+            )
+
+        files_by_identity = {}
+        for path in collect_matching_files(live_dir, "*.png"):
+            identity = extract_livdet_identity(path)
+            if identity is None:
+                print(
+                    f"[!] Ignoring unrecognized LivDet filename: {path.name}"
+                )
+                continue
+            files_by_identity.setdefault(identity, []).append(path)
+
+        if not files_by_identity:
+            raise ValueError(
+                f"No LivDet images with names such as 002_0_5.png were "
+                f"found in {live_dir}"
+            )
+
+        if USER_IDS is None:
+            selected_identities = sorted(
+                files_by_identity,
+                key=identity_sort_key,
+            )
+        else:
+            selected_identities = [
+                identity
+                for identity in dict.fromkeys(USER_IDS)
+                if identity in files_by_identity
+            ]
+
+        for identity in selected_identities:
+            live_files = sorted(
+                files_by_identity[identity],
+                key=sample_sort_key,
+            )
+
+            if len(live_files) <= PROBES_PER_USER:
+                print(
+                    f"[!] Skipping {split}/{identity}: only "
+                    f"{len(live_files)} live images are available; "
+                    f"{PROBES_PER_USER} probes plus at least one genuine "
+                    "candidate are required."
+                )
+                continue
+
+            probe_paths = live_files[:PROBES_PER_USER]
+            identity_glob = f"{identity}_*.png"
+            genuine_candidates = collect_genuine_candidates(
+                live_dir,
+                identity_glob,
+                probe_paths,
+            )
+            fake_candidates = collect_fake_candidates(
+                LIVDET_ROOT,
+                split,
+                FAKE_MATERIALS,
+                identity_glob,
+            )
+
+            if not fake_candidates:
+                print(
+                    f"[i] {split}/{identity}: genuine-only cohort; no matching "
+                    "fake candidates were found in the same partition."
+                )
+
+            # LivDetBatchScorer requires a nonempty fourth directory. For a
+            # genuine-only cohort, stage one genuine scan as a compatibility
+            # placeholder and discard all fourth-directory scores on loading.
+            # Placeholder scores never enter the impostor distribution.
+            score_impostor_candidates = fake_candidates or genuine_candidates[:1]
+
+            cohort_key = f"{split.lower()}__{identity}"
+            selections[cohort_key] = {
+                "split": split,
+                "identity": identity,
+                "probes": probe_paths,
+                "genuine": genuine_candidates,
+                "impostor": fake_candidates,
+                "score_impostor": score_impostor_candidates,
+                "keep_impostor_scores": bool(fake_candidates),
+            }
+
+    if not selections:
+        raise ValueError("No LivDet identities were selected.")
+
+    return selections
+
+
+# =========================
+# SourceAFIS batch scoring
+# =========================
+def run_sourceafis_batch_best_of_probes(
+    identity,
+    probe_paths,
+    genuine_candidates,
+    fake_candidates,
+    scores_csv,
+):
+    """Run the existing LivDetBatchScorer for one enrolled identity."""
+    print()
+    print(f"[i] Running SourceAFIS LivDet scorer for identity {identity}")
+    print(f"[i] Probe files count   : {len(probe_paths)}")
+    print(f"[i] Genuine candidates : {len(genuine_candidates)}")
+    print(f"[i] Fake candidates    : {len(fake_candidates)}")
+    print(f"[i] Raw scores CSV     : {scores_csv}")
+
+    with tempfile.TemporaryDirectory(prefix=f"livdet_{identity}_") as tmp:
+        tmp_path = Path(tmp)
+
+        staged_probe_dir, probe_map = stage_files(probe_paths, tmp_path / "probes")
+        staged_genuine_dir, genuine_map = stage_files(genuine_candidates, tmp_path / "genuine_candidates")
+        staged_fake_dir, fake_map = stage_files(fake_candidates, tmp_path / "fake_candidates")
+
+        print("[i] Staged probe dir      :", staged_probe_dir)
+        print("[i] Staged genuine dir    :", staged_genuine_dir)
+        print("[i] Staged fake dir       :", staged_fake_dir)
+
+        # We pass "*.png" because we staged only the intended probes into the probe dir
+        exec_args = (
+            f'"{staged_probe_dir}" '
+            f'"*.png" '
+            f'"{staged_genuine_dir}" '
+            f'"{staged_fake_dir}" '
+            f'"{scores_csv}"'
+        )
+
+        cmd = [
+            "mvn",
+            "-DskipTests",
+            "compile",
+            "exec:java",
+            "-Dexec.mainClass=LivDetBatchScorer",
+            f"-Dexec.args={exec_args}",
+        ]
+
+        print("[i] Running SourceAFIS LivDet batch scorer...")
+        print("[i] Working dir:", SOURCEAFIS_DIR)
+        print("[i] Command:", " ".join(map(str, cmd)))
+
+        subprocess.run(
+            cmd,
+            cwd=SOURCEAFIS_DIR,
+            check=True,
+            text=True,
+        )
+
+        return probe_map, genuine_map, fake_map
+
+
+# =========================
+# CSV parsing / aggregation
+# =========================
+def find_first_existing(row, candidates, required=True):
+    for c in candidates:
+        if c in row and str(row[c]).strip() != "":
+            return row[c]
+    if required:
+        raise KeyError(f"Could not find any of columns: {candidates}")
+    return None
+
+
+def load_scores_from_csv_best_per_candidate(scores_csv, *, keep_impostor_scores=True):
+    """
+    Each CSV row is one comparison:
+        probe (stored template) vs target (candidate)
+
+    We want:
+        final_score(target) = max score over all probes
+
+    Group by:
+        - kind
+        - target
+    """
+
+    genuine_best = {}
+    impostor_best = {}
+
+    with open(scores_csv, "r", newline="") as f:
+        reader = csv.DictReader(f)
+
+        expected = {"kind", "probe", "target", "score"}
+        got = set(reader.fieldnames or [])
+        if not expected.issubset(got):
+            raise ValueError(
+                f"CSV columns mismatch. Expected at least {expected}, got {reader.fieldnames}"
+            )
+
+        rows_seen = 0
+        for row in reader:
+            rows_seen += 1
+
+            kind = row["kind"].strip().lower()
+            probe = row["probe"].strip()
+            target = row["target"].strip()
+            score = float(row["score"])
+
+            # target is the candidate being evaluated
+            if kind == "genuine":
+                genuine_best[target] = max(score, genuine_best.get(target, -np.inf))
+            elif kind in ("impostor", "imposter"):
+                if not keep_impostor_scores:
+                    continue
+                impostor_best[target] = max(score, impostor_best.get(target, -np.inf))
+            else:
+                raise ValueError(f"Unknown kind in CSV: {kind!r}")
+
+    if rows_seen == 0:
+        raise ValueError(f"CSV is empty: {scores_csv}")
+
+    genuine = np.array(list(genuine_best.values()), dtype=float)
+    impostor = np.array(list(impostor_best.values()), dtype=float)
+
+    if len(genuine) == 0:
+        raise ValueError("No genuine scores loaded after best-over-probes aggregation.")
+    if keep_impostor_scores and len(impostor) == 0:
+        raise ValueError("No impostor scores loaded after best-over-probes aggregation.")
+
+    return genuine, impostor, genuine_best, impostor_best
+
+
+def collect_multiuser_scores():
+    """
+    Pool genuine scores from every eligible Live cohort, independently within
+    each partition. Pool impostor scores only from cohorts with matching fakes.
+    """
+    selections = select_users_and_files()
+
+    print(f"[i] Selected {len(selections)} LivDet partition/identity cohorts:")
+    for cohort_key, files in selections.items():
+        print(
+            f"    {files['split']}/{files['identity']}: "
+            f"{len(files['probes'])} probes, "
+            f"{len(files['genuine'])} genuine candidates, "
+            f"{len(files['impostor'])} fake candidates"
+        )
+
+    all_genuine = []
+    all_impostor = []
+    all_genuine_best = {}
+    all_impostor_best = {}
+
+    for cohort_key, files in selections.items():
+        scores_csv = (
+            SCORES_DIR / f"sourceafis_livdet_scores_{cohort_key}.csv"
+        )
+
+        run_sourceafis_batch_best_of_probes(
+            identity=cohort_key,
+            probe_paths=files["probes"],
+            genuine_candidates=files["genuine"],
+            fake_candidates=files["score_impostor"],
+            scores_csv=scores_csv,
+        )
+
+        genuine, impostor, genuine_best, impostor_best = (
+            load_scores_from_csv_best_per_candidate(
+                scores_csv,
+                keep_impostor_scores=files["keep_impostor_scores"],
+            )
+        )
+
+        all_genuine.extend(genuine)
+        all_impostor.extend(impostor)
+        all_genuine_best.update(genuine_best)
+        all_impostor_best.update(impostor_best)
+
+        print(
+            f"[i] {files['split']}/{files['identity']}: pooled "
+            f"{len(genuine)} genuine and {len(impostor)} fake scores"
+        )
+
+    genuine = np.asarray(all_genuine, dtype=float)
+    impostor = np.asarray(all_impostor, dtype=float)
+
+    if genuine.size == 0:
+        raise ValueError("The pooled genuine distribution is empty.")
+    if impostor.size == 0:
+        raise ValueError(
+            "Genuine cohorts were scored, but no matching Fake scans were found "
+            "for any eligible Live identity. FAR and spoof analysis require "
+            "at least one eligible cohort with matching Fake scans."
+        )
+
+    print()
+    print(
+        "[i] Total enrolled partition/identity cohorts: "
+        f"{len(selections)}"
+    )
+    print(
+        "[i] Cohorts contributing genuine scores only: "
+        f"{sum(not files['keep_impostor_scores'] for files in selections.values())}"
+    )
+    print(
+        "[i] Cohorts contributing genuine and fake scores: "
+        f"{sum(files['keep_impostor_scores'] for files in selections.values())}"
+    )
+    print(f"[i] Total pooled genuine scores: {len(genuine)}")
+    print(f"[i] Total pooled fake scores: {len(impostor)}")
+
+    return genuine, impostor, all_genuine_best, all_impostor_best
+
+
+def save_aggregated_scores_csv(genuine_best, impostor_best):
+    with open(AGGREGATED_SCORES_CSV, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["kind", "target", "best_score_over_all_probes"])
+
+        for target, score in sorted(genuine_best.items()):
+            writer.writerow(["genuine", target, score])
+
+        for target, score in sorted(impostor_best.items()):
+            writer.writerow(["impostor", target, score])
+
+
+# =========================
+# Normalize raw SourceAFIS scores to [0,100]
+# =========================
+def normalize_scores_to_100(genuine_scores, impostor_scores):
+    smax = max(np.max(genuine_scores), np.max(impostor_scores))
+    if smax <= 0:
+        raise ValueError("Maximum raw score must be positive for normalization.")
+
+    genuine_norm = 100.0 * genuine_scores / smax
+    impostor_norm = 100.0 * impostor_scores / smax
+
+    genuine_norm = np.clip(genuine_norm, 0.0, 100.0)
+    impostor_norm = np.clip(impostor_norm, 0.0, 100.0)
+
+    return genuine_norm, impostor_norm, smax
+
+
+# =========================
+# Plot histogram + smoothed PDF
+# =========================
+
+def latex_bold(value: str) -> str:
+    return rf"\textbf{{{value}}}"
+
+
+def select_representative_rows(
+    rows: List[Dict[str, float]],
+    n_rows: int = 5,
+) -> List[Dict[str, float]]:
+    """Keep the EER-improvement extremes and highlight gains over atomic-only.
+
+    The first/last rows retain the minimum/maximum failure reduction relative
+    to EER. Interior rows have the largest absolute success-probability gains:
+        max(max_AND, max_OR) - P_safe.
+    Interior rows are displayed in increasing EER-improvement order. Selection
+    uses unrounded values, and each sweep row is selected at most once.
+    """
+    if not rows:
+        raise ValueError("Cannot create a LaTeX table from an empty row list.")
+    if n_rows < 1:
+        raise ValueError("n_rows must be at least 1.")
+
+    valid_rows = [
+        row for row in rows
+        if np.isfinite(row["failure_improvement_ratio"])
+        and all(np.isfinite(row[key]) for key in ("P_safe", "max_AND", "max_OR"))
+    ]
+    if not valid_rows:
+        raise ValueError("No rows have finite improvement and success values.")
+
+    sorted_rows = sorted(
+        valid_rows, key=lambda row: row["failure_improvement_ratio"],
+    )
+    n_rows = min(n_rows, len(sorted_rows))
+    if n_rows == 1:
+        return [sorted_rows[0]]
+
+    middle_rows = sorted(
+        sorted_rows[1:-1],
+        key=lambda row: (
+            max(row["max_AND"], row["max_OR"]) - row["P_safe"],
+            row["failure_improvement_ratio"],
+        ),
+        reverse=True,
+    )[:n_rows - 2]
+    middle_rows.sort(key=lambda row: row["failure_improvement_ratio"])
+    return [sorted_rows[0], *middle_rows, sorted_rows[-1]]
+
+
+def format_table_number(value: float, precision: int = 4) -> str:
+    """Round for display to at most four decimal places; omit trailing zeros."""
+    precision = min(max(int(precision), 0), 4)
+    text = f"{value:.{precision}f}"
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return "0" if text == "-0" else text
+
+
+def format_comparison_pair(
+    first: float,
+    second: float,
+    *,
+    bold: str,
+    precision: int = 4,
+) -> Tuple[str, str]:
+    """
+    Format two values while bolding either the minimum or maximum.
+
+    bold="min":
+        bold the smaller value.
+
+    bold="max":
+        bold the larger value.
+
+    When the values are equal, both are bolded.
+    """
+    first_text = format_table_number(first, precision)
+    second_text = format_table_number(second, precision)
+
+    if np.isclose(first, second):
+        return latex_bold(first_text), latex_bold(second_text)
+
+    if bold == "min":
+        if first < second:
+            return latex_bold(first_text), second_text
+        return first_text, latex_bold(second_text)
+
+    if bold == "max":
+        if first > second:
+            return latex_bold(first_text), second_text
+        return first_text, latex_bold(second_text)
+
+    raise ValueError("bold must be either 'min' or 'max'.")
+
+
+def generate_psafe_latex_table(
+    all_rows: List[Dict[str, float]],
+    out_tex: Path,
+    *,
+    n_rows: int = 5,
+    caption: str = (
+        "Success probabilities at the EER threshold and at the "
+        "mechanism-aware optimal threshold."
+    ),
+    label: str = "tab:psafe_improvement",
+) -> None:
+    """
+    Generate a LaTeX table containing representative sweep configurations.
+
+    Formatting:
+      - The P_safe column is bold.
+      - The worse EER result is bold. Because these are success
+        probabilities, the lower value is considered worse.
+      - The larger of Max AND and Max OR is bold.
+      - Improvement is shown as a percentage.
+    """
+    selected_rows = select_representative_rows(
+        all_rows,
+        n_rows=n_rows,
+    )
+
+    out_tex.parent.mkdir(parents=True, exist_ok=True)
+
+    table_lines = [
+        r"\begin{table*}[t]",
+        r"    \centering",
+        r"    \caption{" + caption + r"}",
+        r"    \label{" + label + r"}",
+        r"    \resizebox{\textwidth}{!}{%",
+        r"    \begin{tabular}{ccccccccc}",
+        r"        \toprule",
+        (
+            r"        $\mathbf{P_{\mathrm{safe}}}$ & "
+            r"$P_{\mathrm{loss}}$ & "
+            r"$P_{\mathrm{leak}}$ & "
+            r"$P_{\mathrm{theft}}$ & "
+            r"AND at EER & "
+            r"OR at EER & "
+            r"Max AND & "
+            r"Max OR & "
+            r"Improvement \\"
+        ),
+        r"        \midrule",
+    ]
+
+    for row in selected_rows:
+        # Lower success probability means worse EER performance.
+        eer_and_text, eer_or_text = format_comparison_pair(
+            row["eer_AND"],
+            row["eer_OR"],
+            bold="min",
+            precision=4,
+        )
+
+        # Bold the better maximum between the two compositions.
+        max_and_text, max_or_text = format_comparison_pair(
+            row["max_AND"],
+            row["max_OR"],
+            bold="max",
+            precision=4,
+        )
+
+        psafe_text = latex_bold(format_table_number(row["P_safe"]))
+        ploss_text = format_table_number(row["P_loss"])
+        pleak_text = format_table_number(row["P_leak"])
+        ptheft_text = format_table_number(row["P_theft"])
+
+        improvement_pct = 100.0 * row["failure_improvement_ratio"]
+        improvement_text = format_table_number(improvement_pct) + r"\%"
+
+        table_lines.append(
+            "        "
+            + " & ".join([
+                psafe_text,
+                ploss_text,
+                pleak_text,
+                ptheft_text,
+                eer_and_text,
+                eer_or_text,
+                max_and_text,
+                max_or_text,
+                improvement_text,
+            ])
+            + r" \\"
+        )
+
+    table_lines.extend([
+        r"        \bottomrule",
+        r"    \end{tabular}%",
+        r"    }",
+        r"\end{table*}",
+        "",
+    ])
+
+    out_tex.write_text(
+        "\n".join(table_lines),
+        encoding="utf-8",
+    )
+
+    print(f"[i] LaTeX table saved to: {out_tex}")
+
+def export_histograms(genuine_scores, impostor_scores):
+    out_dir = OUTPUT_DIR / "figs" / "fig_spoofed_users"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    hist_genuine, edges = np.histogram(genuine_scores, bins=HIST_BINS)
+    hist_impostor, _ = np.histogram(impostor_scores, bins=HIST_BINS)
+
+    centers = (edges[:-1] + edges[1:]) / 2.0
+
+    with open(out_dir / "livdet_sourceafis_histogram_best_of_probes_data.txt", "w") as f:
+        f.write("score genuine impostor\n")
+        for s, g, i in zip(centers, hist_genuine, hist_impostor):
+            f.write(f"{s:.6f} {g:d} {i:d}\n")
+
+
+def empirical_cdf(samples, evaluation_scores):
+    """Evaluate the right-continuous empirical CDF P(S <= s)."""
+    samples = np.asarray(samples, dtype=float)
+    evaluation_scores = np.asarray(evaluation_scores, dtype=float)
+
+    if samples.ndim != 1 or samples.size == 0:
+        raise ValueError("CDF samples must be a non-empty one-dimensional array.")
+    if evaluation_scores.ndim != 1:
+        raise ValueError("CDF evaluation scores must be one-dimensional.")
+    if not np.all(np.isfinite(samples)):
+        raise ValueError("CDF samples contain non-finite values.")
+    if not np.all(np.isfinite(evaluation_scores)):
+        raise ValueError("CDF evaluation scores contain non-finite values.")
+
+    sorted_samples = np.sort(samples)
+    cumulative_counts = np.searchsorted(
+        sorted_samples,
+        evaluation_scores,
+        side="right",
+    )
+    return cumulative_counts.astype(float) / float(sorted_samples.size)
+
+
+def export_empirical_cdfs(
+    genuine_scores,
+    impostor_scores,
+    out_file: Path = CDF_DATA_FILE,
+):
+    """
+    Export exact empirical CDFs for TikZ and statistical fitting.
+
+    The common score grid contains every unique normalized observation from
+    both populations, plus the endpoints 0 and 100. Therefore, no histogram
+    approximation or smoothing is introduced into the exported CDF values.
+    """
+    genuine_scores = np.asarray(genuine_scores, dtype=float)
+    impostor_scores = np.asarray(impostor_scores, dtype=float)
+
+    if genuine_scores.ndim != 1 or genuine_scores.size == 0:
+        raise ValueError("Genuine CDF scores must be a non-empty array.")
+    if impostor_scores.ndim != 1 or impostor_scores.size == 0:
+        raise ValueError("Impostor CDF scores must be a non-empty array.")
+
+    score_grid = np.unique(
+        np.concatenate(
+            (
+                np.asarray([0.0, 100.0]),
+                genuine_scores,
+                impostor_scores,
+            )
+        )
+    )
+    genuine_cdf = empirical_cdf(genuine_scores, score_grid)
+    impostor_cdf = empirical_cdf(impostor_scores, score_grid)
+
+    out_file = Path(out_file)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    with out_file.open("w", newline="") as handle:
+        writer = csv.writer(handle, delimiter=" ", lineterminator="\n")
+        writer.writerow(["score", "genuine_cdf", "impostor_cdf"])
+        for score, genuine_value, impostor_value in zip(
+            score_grid,
+            genuine_cdf,
+            impostor_cdf,
+        ):
+            writer.writerow(
+                [
+                    f"{float(score):.10f}",
+                    f"{float(genuine_value):.10f}",
+                    f"{float(impostor_value):.10f}",
+                ]
+            )
+
+    print(f"[i] Empirical CDF data saved to: {out_file}")
+
+def build_hist_pdf(scores, bins):
+    counts, edges = np.histogram(scores, bins=bins)
+    bw = float(edges[1] - edges[0])
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    pdf = counts / (len(scores) * bw)
+    return centers, pdf, bw
+
+
+def interp_and_smooth_pdf(centers, pdf, step=0.1, sigma_points=3.0, eps=0.0):
+    centers = np.asarray(centers, dtype=float)
+    pdf = np.asarray(pdf, dtype=float)
+
+    x_fine = np.arange(float(centers[0]), float(centers[-1]) + 1e-9, step)
+    y_fine = np.zeros_like(x_fine)
+
+    support_mask = pdf > eps
+    if np.count_nonzero(support_mask) < 2:
+        y_fine = np.interp(x_fine, centers, pdf)
+    else:
+        c_sup = centers[support_mask]
+        p_sup = pdf[support_mask]
+
+        x0 = float(c_sup[0])
+        x1 = float(c_sup[-1])
+
+        inside = (x_fine >= x0) & (x_fine <= x1)
+        y_fine[inside] = np.interp(x_fine[inside], c_sup, p_sup)
+
+    y_s = gaussian_filter1d(y_fine, sigma=sigma_points, mode="nearest")
+
+    area = np.trapezoid(y_s, x_fine)
+    if area > 0:
+        y_s = y_s / area
+
+    return x_fine, y_s
+
+
+# =========================
+# FAR/FRR from smoothed PDFs + EER
+# =========================
+def compute_far_frr_from_smoothed_pdf(genuine_scores, impostor_scores, step=0.1, sigma_points=3.0):
+    cg, pg, _ = build_hist_pdf(genuine_scores, HIST_BINS)
+    ci, pi, _ = build_hist_pdf(impostor_scores, HIST_BINS)
+
+    xg, yg = interp_and_smooth_pdf(cg, pg, step=step, sigma_points=sigma_points)
+    xi, yi = interp_and_smooth_pdf(ci, pi, step=step, sigma_points=sigma_points)
+
+    if not np.allclose(xg, xi):
+        x_min = max(xg[0], xi[0])
+        x_max = min(xg[-1], xi[-1])
+        x = np.arange(x_min, x_max + 1e-9, step)
+        yg = np.interp(x, xg, yg)
+        yi = np.interp(x, xi, yi)
+    else:
+        x = xg
+
+    dx = float(step)
+
+    cdf_g = np.cumsum(yg) * dx
+    surv_i = np.flip(np.cumsum(np.flip(yi))) * dx
+
+    thresholds = x
+    frrs = np.clip(cdf_g, 0.0, 1.0)
+    fars = np.clip(surv_i, 0.0, 1.0)
+
+    return thresholds, fars, frrs
+
+
+def compute_far_frr_from_histogram(
+    genuine_scores,
+    impostor_scores,
+    bins=HIST_BINS,
+):
+    """Compute display FAR/FRR directly from discrete histogram counts.
+
+    Every bin is treated as a probability mass at its center. For an
+    acceptance rule score >= threshold:
+
+        FAR(t) = sum of impostor counts at centers >= t / N_impostor
+        FRR(t) = sum of genuine counts at centers <  t / N_genuine
+
+    No interpolation or smoothing is used.
+    """
+    genuine_counts, edges = np.histogram(genuine_scores, bins=bins)
+    impostor_counts, _ = np.histogram(impostor_scores, bins=bins)
+
+    if genuine_counts.sum() == 0 or impostor_counts.sum() == 0:
+        raise ValueError("Both genuine and impostor histograms must be non-empty.")
+
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    genuine_below = np.concatenate(([0], np.cumsum(genuine_counts)[:-1]))
+    impostor_at_or_above = np.cumsum(impostor_counts[::-1])[::-1]
+
+    center_frrs = genuine_below / genuine_counts.sum()
+    center_fars = impostor_at_or_above / impostor_counts.sum()
+
+    # Complete the discrete histogram curve at the normalized score endpoints.
+    thresholds = np.concatenate(([edges[0]], centers, [edges[-1]]))
+    frrs = np.concatenate(([0.0], center_frrs, [1.0]))
+    fars = np.concatenate(([1.0], center_fars, [0.0]))
+
+    return thresholds, fars.astype(float), frrs.astype(float)
+
+
+def compute_ks_theoretical_far_frr(thresholds):
+    """Evaluate the uniform, quadratic, and normal KS distribution fits."""
+    thresholds = np.asarray(thresholds, dtype=float)
+    return {
+        "uniform": {
+            "far": stats.uniform.sf(thresholds, *KS_UNIFORM_IMPOSTOR),
+            "frr": stats.uniform.cdf(thresholds, *KS_UNIFORM_GENUINE),
+            "genuine_parameters": KS_UNIFORM_GENUINE,
+            "impostor_parameters": KS_UNIFORM_IMPOSTOR,
+        },
+        "quadratic": {
+            "far": stats.rdist.sf(thresholds, *KS_QUADRATIC_IMPOSTOR),
+            "frr": stats.rdist.cdf(thresholds, *KS_QUADRATIC_GENUINE),
+            "genuine_parameters": KS_QUADRATIC_GENUINE,
+            "impostor_parameters": KS_QUADRATIC_IMPOSTOR,
+        },
+        "normal": {
+            "far": stats.norm.sf(thresholds, *KS_NORMAL_IMPOSTOR),
+            "frr": stats.norm.cdf(thresholds, *KS_NORMAL_GENUINE),
+            "genuine_parameters": KS_NORMAL_GENUINE,
+            "impostor_parameters": KS_NORMAL_IMPOSTOR,
+        },
+    }
+
+
+def compute_discrete_eer(thresholds, fars, frrs):
+    """Return the closest available histogram EER point."""
+    index = int(np.argmin(np.abs(fars - frrs)))
+    eer = 0.5 * (float(fars[index]) + float(frrs[index]))
+    return eer, float(thresholds[index])
+
+
+def compute_eer_intersection(thresholds, fars, frrs):
+    d = fars - frrs
+
+    exact = np.where(d == 0)[0]
+    if len(exact) > 0:
+        i = int(exact[0])
+        return float(fars[i]), float(thresholds[i])
+
+    sc = np.where(np.sign(d[:-1]) * np.sign(d[1:]) < 0)[0]
+    if len(sc) == 0:
+        i = int(np.argmin(np.abs(d)))
+        return float(0.5 * (fars[i] + frrs[i])), float(thresholds[i])
+
+    i = int(sc[0])
+    t0, t1 = float(thresholds[i]), float(thresholds[i + 1])
+    d0, d1 = float(d[i]), float(d[i + 1])
+
+    alpha = d0 / (d0 - d1)
+    t_star = t0 + alpha * (t1 - t0)
+
+    far_star = float(fars[i] + alpha * (fars[i + 1] - fars[i]))
+    frr_star = float(frrs[i] + alpha * (frrs[i + 1] - frrs[i]))
+    eer = 0.5 * (far_star + frr_star)
+
+    return eer, t_star
+
+
+def compute_p_success(thresholds, fars, frrs):
+    p_success = (1 - fars) * (1 - frrs)
+    idx_max = np.argmax(p_success)
+    max_threshold = thresholds[idx_max]
+    max_success = p_success[idx_max]
+    return p_success, max_success, max_threshold
+
+
+def export_far_frr(
+    thresholds,
+    fars,
+    frrs,
+    theoretical_thresholds,
+    theoretical,
+    eer,
+    eer_threshold,
+):
+    out_dir = OUTPUT_DIR / "figs" / "fig_spoofed_users"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(out_dir / "livdet_sourceafis_far_frr_best_of_probes_data.txt", "w") as f:
+        f.write("T FAR FRR\n")
+        for t, fa, fr in zip(thresholds, fars, frrs):
+            f.write(f"{t:.6f} {fa:.6f} {fr:.6f}\n")
+
+    with open(
+        out_dir / "livdet_sourceafis_far_frr_theoretical_data.txt",
+        "w",
+    ) as f:
+        f.write(
+            "T FAR_uniform FRR_uniform "
+            "FAR_quadratic FRR_quadratic "
+            "FAR_normal FRR_normal\n"
+        )
+        for index, t in enumerate(theoretical_thresholds):
+            f.write(
+                f"{t:.6f} "
+                f"{theoretical['uniform']['far'][index]:.6f} "
+                f"{theoretical['uniform']['frr'][index]:.6f} "
+                f"{theoretical['quadratic']['far'][index]:.6f} "
+                f"{theoretical['quadratic']['frr'][index]:.6f} "
+                f"{theoretical['normal']['far'][index]:.6f} "
+                f"{theoretical['normal']['frr'][index]:.6f}\n"
+            )
+
+    with open(out_dir / "livdet_sourceafis_far_frr_best_of_probes_points.txt", "w") as f:
+        f.write("T_eer EER\n")
+        f.write(f"{eer_threshold:.6f} {eer:.6f}\n")
+
+def compute_success_and_or(
+    thresholds,
+    fars,
+    frrs,
+    *,
+    eer_threshold,
+    P_safe=0.5,
+    P_leak=0.4,
+    P_loss=0.1,
+    P_theft=0.0,
+):
+    if not np.isclose(P_safe + P_leak + P_loss + P_theft, 1.0):
+        raise ValueError("P_safe + P_leak + P_loss + P_theft must sum to 1")
+
+    p_and = (1 - frrs) * (P_safe + P_leak * (1 - fars))
+    p_or = (1 - fars) * (P_safe + P_loss * (1 - frrs))
+
+    idx_and = int(np.argmax(p_and))
+    idx_or = int(np.argmax(p_or))
+
+    p_and_eer = float(np.interp(eer_threshold, thresholds, p_and))
+    p_or_eer = float(np.interp(eer_threshold, thresholds, p_or))
+
+    return p_and, p_or, idx_and, idx_or, p_and_eer, p_or_eer
+
+
+def export_p_success(thresholds, p_success, eer_threshold, max_success, max_threshold):
+    out_dir = OUTPUT_DIR / "figs" / "fig_spoofed_users"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    p_eer = float(np.interp(eer_threshold, thresholds, p_success))
+
+    with open(out_dir / "livdet_sourceafis_p_success_best_of_probes_data.txt", "w") as f:
+        f.write("T P_success\n")
+        for t, p in zip(thresholds, p_success):
+            f.write(f"{t:.6f} {p:.6f}\n")
+
+    with open(out_dir / "livdet_sourceafis_p_success_best_of_probes_points.txt", "w") as f:
+        f.write("T_eer P_eer T_opt P_opt\n")
+        f.write(f"{eer_threshold:.6f} {p_eer:.6f} {max_threshold:.6f} {max_success:.6f}\n")
+
+
+def export_success_and_or(
+    thresholds,
+    p_and,
+    p_or,
+    idx_and,
+    idx_or,
+    eer_threshold,
+    p_and_eer,
+    p_or_eer,
+):
+    out_dir = OUTPUT_DIR / "figs" / "fig_spoofed_users"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(out_dir / "livdet_sourceafis_success_and_or_best_of_probes_data.txt", "w") as f:
+        f.write("T P_and P_or\n")
+        for t, pa, po in zip(thresholds, p_and, p_or):
+            f.write(f"{t:.6f} {pa:.6f} {po:.6f}\n")
+
+    with open(out_dir / "livdet_sourceafis_success_and_or_best_of_probes_points.txt", "w") as f:
+        f.write("T_and_opt P_and_opt T_or_opt P_or_opt T_eer P_and_eer P_or_eer\n")
+        f.write(
+            f"{thresholds[idx_and]:.6f} {p_and[idx_and]:.6f} "
+            f"{thresholds[idx_or]:.6f} {p_or[idx_or]:.6f} "
+            f"{eer_threshold:.6f} {p_and_eer:.6f} {p_or_eer:.6f}\n"
+        )
+
+# =========================
+# Sweep over P_safe configurations
+# =========================
+def generate_psafe_configs(
+    safe_start: float = 0.50,
+    safe_end: float = 0.90,
+    safe_step: float = 0.01,
+    *,
+    leak_case_base: Tuple[float, float, float, float] = (0.50, 0.45, 0.04, 0.01),
+    loss_case_base: Tuple[float, float, float, float] = (0.50, 0.04, 0.45, 0.01),
+) -> List[Dict[str, float]]:
+    """
+    Generate two families of configurations:
+
+    1) leak_case:
+       P_safe increases from 0.50 to 0.90,
+       P_leak decreases by the same amount,
+       P_loss and P_theft remain fixed.
+
+    2) loss_case:
+       P_safe increases from 0.50 to 0.90,
+       P_loss decreases by the same amount,
+       P_leak and P_theft remain fixed.
+
+    Each family must start from a valid base tuple:
+        (P_safe, P_leak, P_loss, P_theft)
+
+    Returns a list of dicts, one dict per configuration.
+    """
+    configs: List[Dict[str, float]] = []
+
+    safe_values = np.round(np.arange(safe_start, safe_end + 1e-12, safe_step), 2)
+
+    # ---- leak-decreasing family ----
+    base_safe, base_leak, base_loss, base_theft = leak_case_base
+    for psafe in safe_values:
+        delta = round(psafe - base_safe, 10)
+        pleak = round(base_leak - delta, 10)
+        ploss = round(base_loss, 10)
+        ptheft = round(base_theft, 10)
+
+        if pleak < -1e-12:
+            raise ValueError(
+                f"Leak-case invalid: P_leak became negative for P_safe={psafe:.2f}. "
+                f"Choose a larger base leak or a smaller safe range."
+            )
+
+        total = psafe + pleak + ploss + ptheft
+        if not np.isclose(total, 1.0):
+            raise ValueError(
+                f"Leak-case probabilities do not sum to 1: "
+                f"P_safe={psafe}, P_leak={pleak}, P_loss={ploss}, P_theft={ptheft}, total={total}"
+            )
+
+        configs.append({
+            "family": "decrease_leak",
+            "P_safe": psafe,
+            "P_leak": pleak,
+            "P_loss": ploss,
+            "P_theft": ptheft,
+        })
+
+    # ---- loss-decreasing family ----
+    base_safe, base_leak, base_loss, base_theft = loss_case_base
+    for psafe in safe_values:
+        delta = round(psafe - base_safe, 10)
+        ploss = round(base_loss - delta, 10)
+        pleak = round(base_leak, 10)
+        ptheft = round(base_theft, 10)
+
+        if ploss < -1e-12:
+            raise ValueError(
+                f"Loss-case invalid: P_loss became negative for P_safe={psafe:.2f}. "
+                f"Choose a larger base loss or a smaller safe range."
+            )
+
+        total = psafe + pleak + ploss + ptheft
+        if not np.isclose(total, 1.0):
+            raise ValueError(
+                f"Loss-case probabilities do not sum to 1: "
+                f"P_safe={psafe}, P_leak={pleak}, P_loss={ploss}, P_theft={ptheft}, total={total}"
+            )
+
+        configs.append({
+            "family": "decrease_loss",
+            "P_safe": psafe,
+            "P_leak": pleak,
+            "P_loss": ploss,
+            "P_theft": ptheft,
+        })
+
+    return configs
+
+
+def evaluate_config_success(
+    thresholds: np.ndarray,
+    fars: np.ndarray,
+    frrs: np.ndarray,
+    eer_threshold: float,
+    cfg: Dict[str, float],
+) -> Dict[str, float]:
+    """
+    Evaluate one configuration and return:
+      - maximal AND
+      - maximal OR
+      - EER AND
+      - EER OR
+      - best maximal config
+      - improvement in failure percentage as requested
+    """
+    p_and, p_or, idx_and, idx_or, p_and_eer, p_or_eer = compute_success_and_or(
+        thresholds,
+        fars,
+        frrs,
+        eer_threshold=eer_threshold,
+        P_safe=cfg["P_safe"],
+        P_leak=cfg["P_leak"],
+        P_loss=cfg["P_loss"],
+        P_theft=cfg["P_theft"],
+    )
+
+    max_and = float(p_and[idx_and])
+    max_or = float(p_or[idx_or])
+    eer_and = float(p_and_eer)
+    eer_or = float(p_or_eer)
+
+    if max_and >= max_or:
+        best_kind = "AND"
+        best_max = max_and
+        eer_of_maximal_config = eer_and
+        best_threshold = float(thresholds[idx_and])
+    else:
+        best_kind = "OR"
+        best_max = max_or
+        eer_of_maximal_config = eer_or
+        best_threshold = float(thresholds[idx_or])
+
+    denom_reference = eer_of_maximal_config
+    denom_failure = 1.0 - denom_reference
+
+    if np.isclose(denom_failure, 0.0):
+        improvement_failure_ratio = np.nan
+    else:
+        improvement_failure_ratio = (best_max - denom_reference) / denom_failure
+
+    return {
+        "family": cfg["family"],
+        "P_safe": float(cfg["P_safe"]),
+        "P_leak": float(cfg["P_leak"]),
+        "P_loss": float(cfg["P_loss"]),
+        "P_theft": float(cfg["P_theft"]),
+        "max_AND": max_and,
+        "max_OR": max_or,
+        "eer_AND": eer_and,
+        "eer_OR": eer_or,
+        "best_kind": best_kind,
+        "best_max": best_max,
+        "eer_of_maximal_config": eer_of_maximal_config,
+        "best_threshold": best_threshold,
+        "failure_improvement_ratio": float(improvement_failure_ratio),
+    }
+
+
+def sweep_psafe_success(
+    thresholds: np.ndarray,
+    fars: np.ndarray,
+    frrs: np.ndarray,
+    eer_threshold: float,
+    *,
+    safe_start: float = 0.50,
+    safe_end: float = 0.90,
+    safe_step: float = 0.01,
+    leak_case_base: Tuple[float, float, float, float] = (0.50, 0.45, 0.04, 0.01),
+    loss_case_base: Tuple[float, float, float, float] = (0.50, 0.04, 0.45, 0.01),
+) -> Tuple[List[Dict[str, float]], Dict[str, Dict[str, float]], Dict[str, float]]:
+    """
+    Sweep all requested configurations and return:
+      1) all_rows: detailed results for every configuration
+      2) family_best: best row in each family according to best_max
+      3) overall_best: best row overall according to best_max
+    """
+    configs = generate_psafe_configs(
+        safe_start=safe_start,
+        safe_end=safe_end,
+        safe_step=safe_step,
+        leak_case_base=leak_case_base,
+        loss_case_base=loss_case_base,
+    )
+
+    all_rows: List[Dict[str, float]] = []
+    for cfg in configs:
+        row = evaluate_config_success(
+            thresholds=thresholds,
+            fars=fars,
+            frrs=frrs,
+            eer_threshold=eer_threshold,
+            cfg=cfg,
+        )
+        all_rows.append(row)
+
+    leak_rows = [r for r in all_rows if r["family"] == "decrease_leak"]
+    loss_rows = [r for r in all_rows if r["family"] == "decrease_loss"]
+
+    family_best = {
+        "decrease_leak": max(leak_rows, key=lambda r: r["best_max"]),
+        "decrease_loss": max(loss_rows, key=lambda r: r["best_max"]),
+    }
+
+    overall_best = max(all_rows, key=lambda r: r["best_max"])
+
+    return all_rows, family_best, overall_best
+
+
+
+def print_best_atomic_failure_reduction(
+    all_rows: List[Dict[str, float]],
+) -> None:
+    """Print the largest relative failure reduction versus atomic-only.
+
+    For each configuration, reduction = (max(max_AND, max_OR) - P_safe)
+    / (1 - P_safe). A zero atomic-only failure probability has no defined
+    relative reduction, so those configurations are excluded.
+    """
+    candidates = [
+        row for row in all_rows
+        if all(np.isfinite(row[key]) for key in ("P_safe", "max_AND", "max_OR"))
+        and 0.0 <= row["P_safe"] < 1.0
+    ]
+    print("\n[SWEEP SUMMARY] BEST FAILURE REDUCTION VERSUS ATOMIC-ONLY")
+    if not candidates:
+        print("[i] Relative reduction is undefined: no finite configuration with P_safe < 1.")
+        return
+
+    row = max(
+        candidates,
+        key=lambda r: (max(r["max_AND"], r["max_OR"]) - r["P_safe"])
+        / (1.0 - r["P_safe"]),
+    )
+    best_kind = "AND" if row["max_AND"] >= row["max_OR"] else "OR"
+    best_success = max(row["max_AND"], row["max_OR"])
+    atomic_failure = 1.0 - row["P_safe"]
+    optimized_failure = 1.0 - best_success
+    reduction_pct = 100.0 * (best_success - row["P_safe"]) / atomic_failure
+
+    print(f"[i] Family                    : {row['family']}")
+    for key in ("P_safe", "P_loss", "P_leak", "P_theft"):
+        print(f"[i] {key:<26}: {row[key]:.4f}")
+    print(f"[i] Maximal AND               : {row['max_AND']:.4f}")
+    print(f"[i] Maximal OR                : {row['max_OR']:.4f}")
+    print(f"[i] Best composition          : {best_kind}")
+    print(f"[i] Atomic-only failure       : {atomic_failure:.4f}")
+    print(f"[i] Optimized failure         : {optimized_failure:.4f}")
+    print(f"[i] Absolute failure reduction: {100.0 * (best_success - row['P_safe']):.4f} percentage points")
+    print(f"[i] Relative failure reduction: {reduction_pct:.4f}%")
+
+
+def print_psafe_sweep_summary(
+    all_rows: List[Dict[str, float]],
+    family_best: Dict[str, Dict[str, float]],
+    overall_best: Dict[str, float],
+) -> None:
+    """
+    Print:
+      - overall 4 requested results from the overall-best configuration
+      - family-best summaries
+    """
+    print("\n" + "=" * 80)
+    print("[SWEEP SUMMARY] OVERALL BEST CONFIGURATION")
+    print("=" * 80)
+    print(f"[i] Family                    : {overall_best['family']}")
+    print(f"[i] P_safe                    : {overall_best['P_safe']:.2f}")
+    print(f"[i] P_leak                    : {overall_best['P_leak']:.2f}")
+    print(f"[i] P_loss                    : {overall_best['P_loss']:.2f}")
+    print(f"[i] P_theft                   : {overall_best['P_theft']:.2f}")
+    print(f"[i] Maximal AND               : {overall_best['max_AND']:.6f}")
+    print(f"[i] Maximal OR                : {overall_best['max_OR']:.6f}")
+    print(f"[i] EER AND                   : {overall_best['eer_AND']:.6f}")
+    print(f"[i] EER OR                    : {overall_best['eer_OR']:.6f}")
+    print(f"[i] Best configuration kind   : {overall_best['best_kind']}")
+    print(f"[i] Best threshold            : {overall_best['best_threshold']:.6f}")
+    print(f"[i] Best maximal success      : {overall_best['best_max']:.6f}")
+    print(f"[i] EER of maximal config     : {overall_best['eer_of_maximal_config']:.6f}")
+    print(f"[i] Failure improvement ratio : {overall_best['failure_improvement_ratio']:.6f}")
+
+    print("\n" + "=" * 80)
+    print("[SWEEP SUMMARY] BEST PER FAMILY")
+    print("=" * 80)
+    for family_name, row in family_best.items():
+        print(f"\n[i] Family                    : {family_name}")
+        print(f"[i] P_safe                    : {row['P_safe']:.2f}")
+        print(f"[i] P_leak                    : {row['P_leak']:.2f}")
+        print(f"[i] P_loss                    : {row['P_loss']:.2f}")
+        print(f"[i] P_theft                   : {row['P_theft']:.2f}")
+        print(f"[i] Maximal AND               : {row['max_AND']:.6f}")
+        print(f"[i] Maximal OR                : {row['max_OR']:.6f}")
+        print(f"[i] EER AND                   : {row['eer_AND']:.6f}")
+        print(f"[i] EER OR                    : {row['eer_OR']:.6f}")
+        print(f"[i] Best configuration kind   : {row['best_kind']}")
+        print(f"[i] Best threshold            : {row['best_threshold']:.6f}")
+        print(f"[i] Best maximal success      : {row['best_max']:.6f}")
+        print(f"[i] EER of maximal config     : {row['eer_of_maximal_config']:.6f}")
+        print(f"[i] Failure improvement ratio : {row['failure_improvement_ratio']:.6f}")
+
+
+    print_best_atomic_failure_reduction(all_rows)
+
+def save_psafe_sweep_csv(
+    all_rows: List[Dict[str, float]],
+    out_csv: Path,
+) -> None:
+    """
+    Save all sweep results to CSV.
+    """
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    fieldnames = [
+        "family",
+        "P_safe",
+        "P_leak",
+        "P_loss",
+        "P_theft",
+        "max_AND",
+        "max_OR",
+        "eer_AND",
+        "eer_OR",
+        "best_kind",
+        "best_max",
+        "eer_of_maximal_config",
+        "best_threshold",
+        "failure_improvement_ratio",
+    ]
+
+    with open(out_csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in all_rows:
+            writer.writerow(row)
+
+def print_psafe_summary_simple(csv_path: Path):
+    """
+    Prints ONLY:
+    - overall improvement range
+    - best improvement + values
+    - minimal improvement + values
+    """
+
+    rows = []
+    with open(csv_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows.append({
+                "P_safe": float(row["P_safe"]),
+                "P_leak": float(row["P_leak"]),
+                "P_loss": float(row["P_loss"]),
+                "P_theft": float(row["P_theft"]),
+                "max_AND": float(row["max_AND"]),
+                "max_OR": float(row["max_OR"]),
+                "eer_AND": float(row["eer_AND"]),
+                "eer_OR": float(row["eer_OR"]),
+                "best_max": float(row["best_max"]),
+                "failure_improvement_ratio": float(row["failure_improvement_ratio"]),
+            })
+
+    if not rows:
+        print("No data found.")
+        return
+
+    # Convert to percentages
+    for r in rows:
+        r["improvement_pct"] = 100 * r["failure_improvement_ratio"]
+
+    # Find best and worst
+    best_row = max(rows, key=lambda r: r["improvement_pct"])
+    worst_row = min(rows, key=lambda r: r["improvement_pct"])
+
+    min_imp = worst_row["improvement_pct"]
+    max_imp = best_row["improvement_pct"]
+
+    # ===== PRINT =====
+    print(f"Overall improvement range: {min_imp:.2f}% - {max_imp:.2f}%\n")
+
+    print("Best improvement:")
+    print(f"{max_imp:.2f}%")
+    print(f"Psafe: {best_row['P_safe']:.2f}")
+    print(f"Pleak: {best_row['P_leak']:.2f}")
+    print(f"Ploss: {best_row['P_loss']:.2f}")
+    print(f"Ptheft: {best_row['P_theft']:.2f}")
+    print(f"Max AND: {best_row['max_AND']:.6f}")
+    print(f"Max OR: {best_row['max_OR']:.6f}")
+    print(f"EER AND: {best_row['eer_AND']:.6f}")
+    print(f"EER OR: {best_row['eer_OR']:.6f}")
+
+    print("\nMinimal improvement:")
+    print(f"{min_imp:.2f}%")
+    print(f"Psafe: {worst_row['P_safe']:.2f}")
+    print(f"Pleak: {worst_row['P_leak']:.2f}")
+    print(f"Ploss: {worst_row['P_loss']:.2f}")
+    print(f"Ptheft: {worst_row['P_theft']:.2f}")
+    print(f"Max AND: {worst_row['max_AND']:.6f}")
+    print(f"Max OR: {worst_row['max_OR']:.6f}")
+    print(f"EER AND: {worst_row['eer_AND']:.6f}")
+    print(f"EER OR: {worst_row['eer_OR']:.6f}")
+
+
+def save_sweep_inputs(
+    out_file: Path,
+    thresholds: np.ndarray,
+    fars: np.ndarray,
+    frrs: np.ndarray,
+    eer_threshold: float,
+) -> None:
+    """Save every biometric variable required by sweep_psafe_success."""
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        out_file,
+        thresholds=np.asarray(thresholds, dtype=float),
+        fars=np.asarray(fars, dtype=float),
+        frrs=np.asarray(frrs, dtype=float),
+        eer_threshold=np.asarray(float(eer_threshold)),
+    )
+    print(f"[i] Sweep inputs saved to: {out_file}")
+
+
+def load_sweep_inputs(in_file: Path):
+    """Load and validate the saved sweep dependencies."""
+    if not in_file.is_file():
+        raise FileNotFoundError(
+            f"Sweep input checkpoint not found: {in_file}\n"
+            "Run the script once without --sweep-only to create it."
+        )
+
+    with np.load(in_file, allow_pickle=False) as data:
+        required = {"thresholds", "fars", "frrs", "eer_threshold"}
+        missing = required.difference(data.files)
+        if missing:
+            raise ValueError(
+                f"Sweep checkpoint {in_file} is missing {sorted(missing)}."
+            )
+
+        thresholds = np.asarray(data["thresholds"], dtype=float)
+        fars = np.asarray(data["fars"], dtype=float)
+        frrs = np.asarray(data["frrs"], dtype=float)
+        eer_threshold = float(np.asarray(data["eer_threshold"]).item())
+
+    if thresholds.ndim != 1 or fars.ndim != 1 or frrs.ndim != 1:
+        raise ValueError("Saved thresholds, FARs, and FRRs must be one-dimensional.")
+    if not (len(thresholds) == len(fars) == len(frrs)):
+        raise ValueError("Saved thresholds, FARs, and FRRs have different lengths.")
+    if len(thresholds) == 0:
+        raise ValueError("Saved sweep inputs are empty.")
+    if not all(
+        np.all(np.isfinite(values))
+        for values in (thresholds, fars, frrs)
+    ) or not np.isfinite(eer_threshold):
+        raise ValueError("Saved sweep inputs contain non-finite values.")
+
+    print(f"[i] Sweep inputs loaded from: {in_file}")
+    return thresholds, fars, frrs, eer_threshold
+
+
+def run_psafe_sweep_from_inputs(
+    thresholds: np.ndarray,
+    fars: np.ndarray,
+    frrs: np.ndarray,
+    eer_threshold: float,
+    *,
+    safe_start: float,
+    safe_end: float,
+    safe_step: float,
+) -> None:
+    """Run only sweep_psafe_success and its output/summary dependents."""
+    if safe_step <= 0:
+        raise ValueError("safe_step must be positive.")
+    if safe_end < safe_start:
+        raise ValueError("safe_end must be greater than or equal to safe_start.")
+
+    all_rows, family_best, overall_best = sweep_psafe_success(
+        thresholds,
+        fars,
+        frrs,
+        eer_threshold,
+        safe_start=safe_start,
+        safe_end=safe_end,
+        safe_step=safe_step,
+        leak_case_base=SWEEP_LEAK_CASE_BASE,
+        loss_case_base=SWEEP_LOSS_CASE_BASE,
+    )
+
+    print_psafe_sweep_summary(all_rows, family_best, overall_best)
+    save_psafe_sweep_csv(all_rows, SWEEP_RESULTS_CSV)
+    print(f"[i] Sweep CSV saved to: {SWEEP_RESULTS_CSV}")
+
+    generate_psafe_latex_table(
+        all_rows,
+        SWEEP_RESULTS_TEX,
+        n_rows=5,
+        caption=(
+            "Comparison between the success probabilities obtained at the "
+            "EER threshold and the maximal success probabilities obtained "
+            "using mechanism-aware thresholds. Bold EER values indicate the "
+            "worse composition, whereas bold maximal values indicate the "
+            "better composition. The first and last rows show the smallest and "
+            "largest failure reductions relative to the EER result for the "
+            "composition attaining the best optimized success probability. "
+            "The middle rows show the largest absolute gains over the "
+            r"atomic-only success probability, $P_{\mathrm{safe}}$. Improvement reports "
+            "the percentage reduction in failure relative to that EER result."
+        ),
+        label="tab:psafe_sweep_improvement",
+    )
+    print_psafe_summary_simple(SWEEP_RESULTS_CSV)
+
+
+def attempt_biometric_success(
+    attempt_thresholds,
+    thresholds: np.ndarray,
+    fars: np.ndarray,
+    frrs: np.ndarray,
+) -> float:
+    """
+    Compute the biometric-only success probability for k attempts:
+
+        (1 - product(FRR(t_j))) * product(1 - FAR(t_j)).
+    """
+    attempt_thresholds = np.asarray(attempt_thresholds, dtype=float)
+    if attempt_thresholds.ndim != 1 or attempt_thresholds.size < 1:
+        raise ValueError("At least one attempt threshold is required.")
+
+    attempt_fars = np.interp(attempt_thresholds, thresholds, fars)
+    attempt_frrs = np.interp(attempt_thresholds, thresholds, frrs)
+
+    p_user_accepted = 1.0 - np.prod(attempt_frrs)
+    p_attacker_rejected = np.prod(1.0 - attempt_fars)
+    return float(p_user_accepted * p_attacker_rejected)
+
+
+def equal_threshold_success_curve(
+    thresholds: np.ndarray,
+    fars: np.ndarray,
+    frrs: np.ndarray,
+    attempt_count: int,
+) -> np.ndarray:
+    """P_success when the same threshold is used in all k attempts."""
+    if attempt_count < 1:
+        raise ValueError("attempt_count must be at least 1.")
+    return (
+        (1.0 - np.power(frrs, attempt_count))
+        * np.power(1.0 - fars, attempt_count)
+    )
+
+
+def user_attacker_success_curve(
+    fars: np.ndarray,
+    frrs: np.ndarray,
+    user_attempts: int,
+    attacker_attempts: int,
+) -> np.ndarray:
+    """Equal-threshold baseline for asymmetric user/attacker attempt limits."""
+    if user_attempts < 1 or attacker_attempts < 1:
+        raise ValueError("User and attacker attempt counts must be at least 1.")
+    return (
+        (1.0 - np.power(frrs, user_attempts))
+        * np.power(1.0 - fars, attacker_attempts)
+    )
+
+
+def user_attacker_policy_success(
+    attempt_thresholds,
+    thresholds: np.ndarray,
+    fars: np.ndarray,
+    frrs: np.ndarray,
+    user_attempts: int,
+    attacker_attempts: int,
+) -> float:
+    """Evaluate a per-attempt threshold policy for unequal attempt limits."""
+    attempt_thresholds = np.asarray(attempt_thresholds, dtype=float)
+    required_count = max(user_attempts, attacker_attempts)
+    if user_attempts < 1 or attacker_attempts < 1:
+        raise ValueError("User and attacker attempt counts must be at least 1.")
+    if attempt_thresholds.ndim != 1 or attempt_thresholds.size != required_count:
+        raise ValueError(
+            f"Exactly {required_count} per-attempt thresholds are required."
+        )
+
+    attempt_fars = np.interp(attempt_thresholds, thresholds, fars)
+    attempt_frrs = np.interp(attempt_thresholds, thresholds, frrs)
+    p_user_success = 1.0 - np.prod(attempt_frrs[:user_attempts])
+    p_attacker_rejected = np.prod(
+        1.0 - attempt_fars[:attacker_attempts]
+    )
+    return float(p_user_success * p_attacker_rejected)
+
+
+def user_attacker_policy_probabilities(
+    attempt_thresholds,
+    thresholds: np.ndarray,
+    fars: np.ndarray,
+    frrs: np.ndarray,
+    user_attempts: int,
+    attacker_attempts: int,
+):
+    """Return the user-success and attacker-rejection probabilities."""
+    attempt_thresholds = np.asarray(attempt_thresholds, dtype=float)
+    required_count = max(user_attempts, attacker_attempts)
+    if user_attempts < 1 or attacker_attempts < 1:
+        raise ValueError("User and attacker attempt counts must be at least 1.")
+    if attempt_thresholds.ndim != 1 or attempt_thresholds.size != required_count:
+        raise ValueError(
+            f"Exactly {required_count} per-attempt thresholds are required."
+        )
+
+    attempt_fars = np.interp(attempt_thresholds, thresholds, fars)
+    attempt_frrs = np.interp(attempt_thresholds, thresholds, frrs)
+    p_user_success = float(
+        1.0 - np.prod(attempt_frrs[:user_attempts])
+    )
+    p_attacker_rejected = float(
+        np.prod(1.0 - attempt_fars[:attacker_attempts])
+    )
+    return p_user_success, p_attacker_rejected
+
+
+def conditional_user_mean_attempts(
+    attempt_thresholds,
+    thresholds: np.ndarray,
+    frrs: np.ndarray,
+    user_attempts: int,
+) -> float:
+    """Mean first-success attempt, conditioned on success by k_u."""
+    attempt_thresholds = np.asarray(attempt_thresholds, dtype=float)
+    if user_attempts < 1:
+        raise ValueError("user_attempts must be at least 1.")
+    if attempt_thresholds.ndim != 1 or attempt_thresholds.size < user_attempts:
+        raise ValueError(
+            f"At least {user_attempts} per-attempt thresholds are required."
+        )
+
+    attempt_frrs = np.interp(
+        attempt_thresholds[:user_attempts],
+        thresholds,
+        frrs,
+    )
+    rejection_before_attempt = np.concatenate(
+        ([1.0], np.cumprod(attempt_frrs[:-1]))
+    )
+    first_success_probabilities = (
+        rejection_before_attempt * (1.0 - attempt_frrs)
+    )
+    p_user_success = float(np.sum(first_success_probabilities))
+    if p_user_success <= np.finfo(float).eps:
+        return float("inf")
+
+    attempt_numbers = np.arange(1, user_attempts + 1, dtype=float)
+    return float(
+        np.dot(attempt_numbers, first_success_probabilities)
+        / p_user_success
+    )
+
+
+def optimize_success_with_mean_attempt_limit(
+    thresholds, fars, frrs, *, user_attempts, attacker_attempts,
+    maximum_mean_attempts, optimizer_starts=64, de_maxiter=300,
+):
+    """Largest joint success found with E[J | user succeeds] <= limit.
+
+    Uses the same independent-attempt probabilities and shared threshold
+    schedule as the existing policy optimizers. This is a numerical search,
+    not a certificate of global optimality.
+    """
+    thresholds, fars, frrs = (
+        np.asarray(a, dtype=float) for a in (thresholds, fars, frrs)
+    )
+    if (thresholds.ndim != 1 or thresholds.size < 2
+            or fars.shape != thresholds.shape or frrs.shape != thresholds.shape
+            or not all(np.all(np.isfinite(a)) for a in (thresholds, fars, frrs))
+            or np.any(np.diff(thresholds) <= 0)
+            or np.any((fars < 0) | (fars > 1))
+            or np.any((frrs < 0) | (frrs > 1))):
+        raise ValueError("Need increasing finite thresholds and matching FAR/FRR arrays in [0, 1].")
+    if user_attempts < 1 or attacker_attempts < 1 or optimizer_starts < 1:
+        raise ValueError("Attempt counts and optimizer starts must be positive.")
+    if not np.isfinite(maximum_mean_attempts) or maximum_mean_attempts < 1:
+        raise ValueError("The conditional mean attempt limit must be finite and at least 1.")
+    count = max(user_attempts, attacker_attempts)
+    lo, hi = float(thresholds[0]), float(thresholds[-1])
+    # Optimize in [0, 1] so numerical tolerances do not depend on score units.
+    def unpack(x):
+        return lo + (hi - lo) * np.asarray(x)
+
+    def quantities(x):
+        t = unpack(x)
+        rr = np.interp(t[:user_attempts], thresholds, frrs)
+        first = np.concatenate(([1.0], np.cumprod(rr[:-1]))) * (1.0 - rr)
+        pu = float(first.sum())
+        pa = float(np.prod(1.0 - np.interp(t[:attacker_attempts], thresholds, fars)))
+        weighted = float(np.dot(np.arange(1, user_attempts + 1), first))
+        mean = weighted / pu if pu > np.finfo(float).eps else float("inf")
+        return pu * pa, mean, maximum_mean_attempts * pu - weighted, pu
+
+    tolerance = 1e-9
+    best_x, best_success = None, -1.0
+    def remember(x):
+        nonlocal best_x, best_success
+        x = np.clip(np.asarray(x), 0.0, 1.0)
+        success, mean, _, _ = quantities(x)
+        if np.isfinite(mean) and mean <= maximum_mean_attempts + tolerance:
+            if success > best_success:
+                best_x, best_success = x.copy(), success
+
+    def penalty(x):
+        success, mean, _, _ = quantities(x)
+        if not np.isfinite(mean):
+            return 1e6
+        return -success + 1e4 * max(0.0, mean - maximum_mean_attempts) ** 2
+
+    rng = np.random.default_rng(42)
+    seeds = []
+    for v in np.unique(np.r_[np.linspace(0, 1, 65), (thresholds - lo) / (hi - lo)]):
+        # Equal policies, attacker-only strict tail, and early success policies.
+        equal = np.full(count, v)
+        tail = equal.copy()
+        tail[user_attempts:] = 1.0
+        early = np.ones(count)
+        early[0] = v
+        seeds.extend((equal, tail, early))
+    seeds.extend(rng.random((optimizer_starts, count)))
+    for seed in seeds:
+        remember(seed)
+    global_result = differential_evolution(
+        penalty, [(0.0, 1.0)] * count, seed=42, maxiter=de_maxiter,
+        popsize=15, tol=1e-9, polish=False,
+    )
+    remember(global_result.x)
+    # Start constrained searches from both feasible policies and penalty minima.
+    ranked = sorted(seeds, key=penalty)
+    starts = [global_result.x]
+    if best_x is not None:
+        starts.append(best_x.copy())
+    starts.extend(ranked[:max(0, optimizer_starts - len(starts))])
+    starts = starts[:optimizer_starts]
+    completed, feasible = 0, 0
+    constraints = [
+        {"type": "ineq", "fun": lambda x: quantities(x)[2]},
+        {"type": "ineq", "fun": lambda x: quantities(x)[3] - 1e-12},
+    ]
+    for seed in starts:
+        result = minimize(
+            lambda x: -quantities(x)[0], seed, method="SLSQP",
+            bounds=[(0.0, 1.0)] * count, constraints=constraints,
+            options={"maxiter": 2000, "ftol": 1e-12},
+        )
+        completed += int(result.success)
+        mean = quantities(result.x)[1]
+        feasible += int(np.isfinite(mean) and mean <= maximum_mean_attempts + tolerance)
+        remember(result.x)
+    if best_x is None:
+        raise ValueError("No feasible positive-user-success policy found for the mean attempt limit.")
+    return unpack(best_x), best_success, {
+        "conditional_mean_attempts": quantities(best_x)[1],
+        "successful_local_runs": completed, "feasible_local_runs": feasible,
+        "local_runs": len(starts), "global_search_converged": bool(global_result.success),
+    }
+
+
+def run_maximum_success_mean_attempt_policy(
+    thresholds, fars, frrs, *, user_attempts, attacker_attempts,
+    maximum_mean_attempts, optimizer_starts=64, plot_output_dir=None,
+    saturation_gain_tolerance=0.01,
+):
+    """Report a cached-input policy under a conditional mean attempt cap."""
+    policy, success, diagnostics = optimize_success_with_mean_attempt_limit(
+        thresholds, fars, frrs, user_attempts=user_attempts,
+        attacker_attempts=attacker_attempts, maximum_mean_attempts=maximum_mean_attempts,
+        optimizer_starts=optimizer_starts,
+    )
+    pu, pa = user_attacker_policy_probabilities(
+        policy, thresholds, fars, frrs, user_attempts, attacker_attempts,
+    )
+    mean = diagnostics["conditional_mean_attempts"]
+    print("\nMaximum joint success with a conditional mean user-attempt limit")
+    print(f"Mean limit: {maximum_mean_attempts:.10g}; achieved E[J | user succeeds]: {mean:.10g}")
+    print(f"P_user_success = {pu:.10g}")
+    print(f"P_attacker_rejected = {pa:.10g}; P_attacker_success = {1-pa:.10g}")
+    print(f"P_success = {success:.10g} (largest found by numerical search)")
+    print("Attempt  Threshold  FAR  FRR  Applies to")
+    for j, t in enumerate(policy, 1):
+        roles = []
+        if j <= user_attempts:
+            roles.append("user")
+        if j <= attacker_attempts:
+            roles.append("attacker")
+        print(f"{j:>7}  {t:.10g}  {np.interp(t, thresholds, fars):.10g}  "
+              f"{np.interp(t, thresholds, frrs):.10g}  {' + '.join(roles)}")
+    print(f"Local searches: {diagnostics['successful_local_runs']} converged, "
+          f"{diagnostics['feasible_local_runs']}/{diagnostics['local_runs']} feasible; "
+          f"global search converged: {diagnostics['global_search_converged']}")
+    graphs = export_attempt_policy_graphs(
+        policy, thresholds, fars, frrs,
+        user_attempts=user_attempts, attacker_attempts=attacker_attempts,
+        output_dir=plot_output_dir,
+        saturation_gain_tolerance=saturation_gain_tolerance,
+        policy_label=f"Mean limit={maximum_mean_attempts:g}",
+    )
+    return {"graphs": graphs, "attempt_thresholds": policy, "success_probability": success,
+            "user_success_probability": pu, "attacker_rejection_probability": pa,
+            **diagnostics}
+
+
+def run_minimum_mean_user_attempt_policy(
+    thresholds: np.ndarray,
+    fars: np.ndarray,
+    frrs: np.ndarray,
+    *,
+    user_attempts: int,
+    attacker_attempts: int,
+    minimum_success_probability: float,
+    eer_threshold: float,
+    minimum_user_success_probability=None,
+    minimum_attacker_rejection_probability=None,
+    optimizer_starts: int = 64,
+    plot_output_dir=None,
+    saturation_gain_tolerance=0.01,
+):
+    """Minimize the conditional mean under joint or separate constraints."""
+    use_separate_constraints = (
+        minimum_user_success_probability is not None
+        or minimum_attacker_rejection_probability is not None
+    )
+    if use_separate_constraints:
+        if (
+            minimum_user_success_probability is None
+            or minimum_attacker_rejection_probability is None
+        ):
+            raise ValueError(
+                "Both separate probability constraints must be provided."
+            )
+        optimal_thresholds, mean_attempts, diagnostics = (
+            optimize_user_mean_attempts_with_separate_constraints(
+                thresholds,
+                fars,
+                frrs,
+                user_attempts,
+                attacker_attempts,
+                minimum_user_success_probability=(
+                    minimum_user_success_probability
+                ),
+                minimum_attacker_rejection_probability=(
+                    minimum_attacker_rejection_probability
+                ),
+                eer_threshold=eer_threshold,
+                n_starts=optimizer_starts,
+            )
+        )
+    else:
+        optimal_thresholds, mean_attempts, diagnostics = (
+            optimize_user_mean_attempts_with_success_constraint(
+                thresholds,
+                fars,
+                frrs,
+                user_attempts,
+                attacker_attempts,
+                minimum_success_probability=minimum_success_probability,
+                eer_threshold=eer_threshold,
+                n_starts=optimizer_starts,
+            )
+        )
+
+    attempt_fars = np.interp(optimal_thresholds, thresholds, fars)
+    attempt_frrs = np.interp(optimal_thresholds, thresholds, frrs)
+    user_frrs = attempt_frrs[:user_attempts]
+    rejection_before_attempt = np.concatenate(
+        ([1.0], np.cumprod(user_frrs[:-1]))
+    )
+    first_success_probabilities = (
+        rejection_before_attempt * (1.0 - user_frrs)
+    )
+    p_user_success = float(np.sum(first_success_probabilities))
+    conditional_first_success = (
+        first_success_probabilities / p_user_success
+    )
+    p_attacker_rejected = float(
+        np.prod(1.0 - attempt_fars[:attacker_attempts])
+    )
+    p_success = float(p_user_success * p_attacker_rejected)
+
+    print("\n" + "=" * 80)
+    print("[MINIMUM CONDITIONAL MEAN USER ATTEMPT POLICY]")
+    print("=" * 80)
+    print(f"Predetermined k_u:              {user_attempts}")
+    print(f"Predetermined k_a:              {attacker_attempts}")
+    if use_separate_constraints:
+        print(
+            "Required user success:          "
+            f">= {minimum_user_success_probability:.10f}"
+        )
+        print(
+            "Required attacker rejection:    "
+            f">= {minimum_attacker_rejection_probability:.10f}"
+        )
+    else:
+        print(
+            "Required P_success:             "
+            f">= {minimum_success_probability:.10f}"
+        )
+    print(f"Optimizer:                      {diagnostics['method']}")
+    for index, threshold in enumerate(optimal_thresholds, start=1):
+        user_detail = ""
+        if index <= user_attempts:
+            user_detail = (
+                f", P(N_U={index})={first_success_probabilities[index - 1]:.10f}"
+                f", P(N_U={index} | success)="
+                f"{conditional_first_success[index - 1]:.10f}"
+            )
+        print(
+            f"Attempt {index:2d}: t={threshold:.6f}, "
+            f"FAR={attempt_fars[index - 1]:.10f}, "
+            f"FRR={attempt_frrs[index - 1]:.10f}"
+            f"{user_detail}"
+        )
+
+    print(f"User success probability:       {p_user_success:.10f}")
+    print(f"Attacker rejection probability: {p_attacker_rejected:.10f}")
+    print(f"P_success:                      {p_success:.10f}")
+    if use_separate_constraints:
+        print(
+            "User-success constraint slack:  "
+            f"{p_user_success - minimum_user_success_probability:.10e}"
+        )
+        print(
+            "Attacker-rejection slack:       "
+            f"{p_attacker_rejected - minimum_attacker_rejection_probability:.10e}"
+        )
+    else:
+        print(
+            "Constraint slack:               "
+            f"{p_success - minimum_success_probability:.10e}"
+        )
+    print(f"Conditional mean user attempts: {mean_attempts:.10f}")
+
+    graphs = export_attempt_policy_graphs(
+        optimal_thresholds, thresholds, fars, frrs,
+        user_attempts=user_attempts, attacker_attempts=attacker_attempts,
+        output_dir=plot_output_dir,
+        saturation_gain_tolerance=saturation_gain_tolerance,
+        policy_label=("Separate probability constraints" if use_separate_constraints
+                      else f"P_success >= {minimum_success_probability:g}"),
+    )
+    return {
+        "graphs": graphs,
+        "k_user": user_attempts,
+        "k_attacker": attacker_attempts,
+        "minimum_success_probability": minimum_success_probability,
+        "minimum_user_success_probability": (
+            minimum_user_success_probability
+        ),
+        "minimum_attacker_rejection_probability": (
+            minimum_attacker_rejection_probability
+        ),
+        "thresholds": optimal_thresholds,
+        "fars": attempt_fars,
+        "frrs": attempt_frrs,
+        "first_success_probabilities": first_success_probabilities,
+        "conditional_first_success_probabilities": conditional_first_success,
+        "p_user_success": p_user_success,
+        "p_attacker_rejected": p_attacker_rejected,
+        "p_success": p_success,
+        "conditional_mean_user_attempts": mean_attempts,
+        "optimizer_diagnostics": diagnostics,
+    }
+
+
+def run_fixed_user_attacker_policy(
+    thresholds: np.ndarray,
+    fars: np.ndarray,
+    frrs: np.ndarray,
+    *,
+    user_attempts: int,
+    attacker_attempts: int,
+    eer_threshold: float,
+    optimizer_starts: int = 64,
+    tikz_data_file: Path = FIXED_USER_ATTACKER_TIKZ_DATA,
+):
+    """Jointly optimize per-attempt thresholds for fixed attempt budgets."""
+    optimal_thresholds, p_success, diagnostics = (
+        optimize_user_attacker_thresholds(
+            thresholds,
+            fars,
+            frrs,
+            user_attempts,
+            attacker_attempts,
+            eer_threshold=eer_threshold,
+            n_starts=optimizer_starts,
+        )
+    )
+    attempt_fars = np.interp(optimal_thresholds, thresholds, fars)
+    attempt_frrs = np.interp(optimal_thresholds, thresholds, frrs)
+    p_user_success = float(
+        1.0 - np.prod(attempt_frrs[:user_attempts])
+    )
+    p_attacker_rejected = float(
+        np.prod(1.0 - attempt_fars[:attacker_attempts])
+    )
+    p_attacker_success = float(1.0 - p_attacker_rejected)
+    single_attempt_success = (1.0 - frrs) * (1.0 - fars)
+    single_attempt_index = int(np.argmax(single_attempt_success))
+    single_attempt_threshold = float(thresholds[single_attempt_index])
+
+    curve_rows = export_fixed_user_attacker_success_by_k(
+        thresholds,
+        fars,
+        frrs,
+        optimal_thresholds,
+        user_attempts=user_attempts,
+        attacker_attempts=attacker_attempts,
+        eer_threshold=eer_threshold,
+        single_attempt_threshold=single_attempt_threshold,
+        out_file=tikz_data_file,
+    )
+
+    print("\n" + "=" * 80)
+    print("[FIXED USER/ATTACKER ATTEMPT POLICY]")
+    print("=" * 80)
+    print(f"Predetermined k_u:              {user_attempts}")
+    print(f"Predetermined k_a:              {attacker_attempts}")
+    print(f"Optimizer:                      {diagnostics['method']}")
+    for index, threshold in enumerate(optimal_thresholds, start=1):
+        used_by = []
+        if index <= user_attempts:
+            used_by.append("user")
+        if index <= attacker_attempts:
+            used_by.append("attacker")
+        print(
+            f"Attempt {index:2d}: t={threshold:.6f}, "
+            f"FAR={attempt_fars[index - 1]:.10f}, "
+            f"FRR={attempt_frrs[index - 1]:.10f}, "
+            f"used by {' and '.join(used_by)}"
+        )
+    print(f"User success probability:       {p_user_success:.10f}")
+    print(f"Attacker rejection probability: {p_attacker_rejected:.10f}")
+    print(f"Attacker success probability:   {p_attacker_success:.10f}")
+    print(f"Maximum P_success:              {p_success:.10f}")
+    print(f"EER baseline P_success:         {curve_rows[-1][4]:.10f}")
+    print(
+        "Single-attempt-optimum baseline P_success: "
+        f"{curve_rows[-1][5]:.10f}"
+    )
+    print(f"[i] Fixed-policy TikZ data saved to: {tikz_data_file}")
+
+    return {
+        "k_user": user_attempts,
+        "k_attacker": attacker_attempts,
+        "thresholds": optimal_thresholds,
+        "fars": attempt_fars,
+        "frrs": attempt_frrs,
+        "p_user_success": p_user_success,
+        "p_attacker_rejected": p_attacker_rejected,
+        "p_attacker_success": p_attacker_success,
+        "p_success": p_success,
+        "single_attempt_threshold": single_attempt_threshold,
+        "curve_rows": curve_rows,
+        "optimizer_diagnostics": diagnostics,
+    }
+
+
+def export_fixed_user_attacker_success_by_k(
+    thresholds: np.ndarray,
+    fars: np.ndarray,
+    frrs: np.ndarray,
+    optimal_thresholds: np.ndarray,
+    *,
+    user_attempts: int,
+    attacker_attempts: int,
+    eer_threshold: float,
+    single_attempt_threshold: float,
+    out_file: Path = FIXED_USER_ATTACKER_TIKZ_DATA,
+):
+    """Export cumulative success through a fixed asymmetric policy horizon."""
+    horizon = max(user_attempts, attacker_attempts)
+    optimal_thresholds = np.asarray(optimal_thresholds, dtype=float)
+    if optimal_thresholds.size != horizon:
+        raise ValueError(f"Exactly {horizon} optimized thresholds are required.")
+
+    optimized_fars = np.interp(optimal_thresholds, thresholds, fars)
+    optimized_frrs = np.interp(optimal_thresholds, thresholds, frrs)
+    eer_far = float(np.interp(eer_threshold, thresholds, fars))
+    eer_frr = float(np.interp(eer_threshold, thresholds, frrs))
+    single_far = float(
+        np.interp(single_attempt_threshold, thresholds, fars)
+    )
+    single_frr = float(
+        np.interp(single_attempt_threshold, thresholds, frrs)
+    )
+
+    rows = []
+    for attempt in range(1, horizon + 1):
+        active_user_attempts = min(attempt, user_attempts)
+        active_attacker_attempts = min(attempt, attacker_attempts)
+        p_optimized = float(
+            (
+                1.0
+                - np.prod(optimized_frrs[:active_user_attempts])
+            )
+            * np.prod(
+                1.0 - optimized_fars[:active_attacker_attempts]
+            )
+        )
+        p_eer = float(
+            (1.0 - eer_frr ** active_user_attempts)
+            * (1.0 - eer_far) ** active_attacker_attempts
+        )
+        p_single = float(
+            (1.0 - single_frr ** active_user_attempts)
+            * (1.0 - single_far) ** active_attacker_attempts
+        )
+        rows.append(
+            (
+                attempt,
+                active_user_attempts,
+                active_attacker_attempts,
+                p_optimized,
+                p_eer,
+                p_single,
+            )
+        )
+
+    out_file = Path(out_file)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    with out_file.open("w", newline="") as handle:
+        writer = csv.writer(handle, delimiter=" ", lineterminator="\n")
+        writer.writerow(
+            [
+                "k",
+                "active_user_attempts",
+                "active_attacker_attempts",
+                "P_success_optimized",
+                "P_success_EER",
+                "P_success_single_attempt_optimum",
+            ]
+        )
+        for row in rows:
+            writer.writerow(
+                list(row[:3])
+                + [f"{value:.10f}" for value in row[3:]]
+            )
+
+    return rows
+
+
+def optimize_sequential_attempt_policy(
+    thresholds: np.ndarray,
+    fars: np.ndarray,
+    frrs: np.ndarray,
+    attempt_count: int,
+):
+    """
+    Greedily build a chronological threshold policy.
+
+    First optimize t1 as a one-attempt mechanism. For every later attempt j,
+    keep t1, ..., t(j-1) fixed and optimize only tj for the cumulative
+    j-attempt success probability. The mechanism stops after an acceptance,
+    so attempt j is reached only if every preceding attempt was rejected.
+    """
+    if attempt_count < 1:
+        raise ValueError("attempt_count must be at least 1.")
+
+    policy = []
+    selected_thresholds = []
+    for attempt_number in range(1, attempt_count + 1):
+        if selected_thresholds:
+            selected_fars = np.interp(
+                selected_thresholds,
+                thresholds,
+                fars,
+            )
+            selected_frrs = np.interp(
+                selected_thresholds,
+                thresholds,
+                frrs,
+            )
+            prior_attacker_rejection = float(
+                np.prod(1.0 - selected_fars)
+            )
+            prior_user_rejection = float(np.prod(selected_frrs))
+        else:
+            prior_attacker_rejection = 1.0
+            prior_user_rejection = 1.0
+
+        cumulative_success_curve = (
+            (1.0 - prior_user_rejection * frrs)
+            * prior_attacker_rejection
+            * (1.0 - fars)
+        )
+        optimal_index = int(np.argmax(cumulative_success_curve))
+        optimal_threshold = float(thresholds[optimal_index])
+        selected_thresholds.append(optimal_threshold)
+        policy.append(
+            {
+                "attempt_number": attempt_number,
+                "threshold": optimal_threshold,
+                "far": float(fars[optimal_index]),
+                "frr": float(frrs[optimal_index]),
+                "cumulative_success": float(
+                    cumulative_success_curve[optimal_index]
+                ),
+            }
+        )
+
+    policy_success = attempt_biometric_success(
+        selected_thresholds,
+        thresholds,
+        fars,
+        frrs,
+    )
+    return policy, policy_success
+
+
+def attempt_biometric_objective_with_gradient(
+    attempt_thresholds, thresholds, fars, frrs,
+):
+    """Negative joint success and exact segment gradient of interpolated rates.
+
+    Prefix/suffix products avoid division by zero when FAR or FRR is zero
+    or one. At interpolation knots, use the right segment, except at the
+    upper bound where the left segment is used. No finite differences.
+    """
+    grid = np.asarray(thresholds, dtype=float)
+    x = np.clip(np.asarray(attempt_thresholds, dtype=float), grid[0], grid[-1])
+    far_values = np.interp(x, grid, fars)
+    frr_values = np.interp(x, grid, frrs)
+    segment = np.clip(np.searchsorted(grid, x, side='right') - 1, 0, grid.size - 2)
+    widths = grid[segment + 1] - grid[segment]
+    far_slopes = (np.asarray(fars)[segment + 1] - np.asarray(fars)[segment]) / widths
+    frr_slopes = (np.asarray(frrs)[segment + 1] - np.asarray(frrs)[segment]) / widths
+    rejection = 1.0 - far_values
+    def products_except_each(values):
+        left = np.r_[1.0, np.cumprod(values[:-1])]
+        right = np.r_[np.cumprod(values[:0:-1])[::-1], 1.0]
+        return left * right
+    user_failure = float(np.prod(frr_values))
+    attacker_rejection = float(np.prod(rejection))
+    value = -(1.0 - user_failure) * attacker_rejection
+    gradient = (
+        attacker_rejection * frr_slopes * products_except_each(frr_values)
+        + (1.0 - user_failure) * far_slopes * products_except_each(rejection)
+    )
+    return float(value), np.asarray(gradient, dtype=float)
+
+
+def optimize_attempt_thresholds(
+    thresholds: np.ndarray,
+    fars: np.ndarray,
+    frrs: np.ndarray,
+    attempt_count: int,
+    *,
+    eer_threshold: float,
+    n_starts: int = 64,
+    seed: int = 20260827,
+    de_maxiter: int = 500,
+    de_popsize: int = 20,
+    initial_candidates=None,
+):
+    """
+    Jointly optimize k bounded thresholds using a global/local hybrid.
+
+    Differential evolution first searches globally, including asymmetric
+    threshold vectors. L-BFGS-B then refines that result and also starts from
+    the best equal-threshold grid points, the one-attempt optimum, the EER
+    threshold, deterministic spread points, and reproducible random points.
+    The best feasible result across every run is returned. The equal-threshold
+    grid optimum is always retained as a baseline.
+    """
+    if attempt_count < 1:
+        raise ValueError("attempt_count must be at least 1.")
+    if n_starts < 1 or de_maxiter < 1 or de_popsize < 1:
+        raise ValueError("Local starts, global iterations and population multiplier must be positive.")
+
+    lower = float(thresholds[0])
+    upper = float(thresholds[-1])
+    bounds = [(lower, upper)] * attempt_count
+
+    def objective(candidate_thresholds):
+        return -attempt_biometric_success(
+            candidate_thresholds,
+            thresholds,
+            fars,
+            frrs,
+        )
+
+    equal_success = equal_threshold_success_curve(
+        thresholds,
+        fars,
+        frrs,
+        attempt_count,
+    )
+    equal_index = int(np.argmax(equal_success))
+    best_thresholds = np.full(
+        attempt_count,
+        float(thresholds[equal_index]),
+    )
+    best_success = float(equal_success[equal_index])
+
+    retained_starts = []
+    for candidate in (() if initial_candidates is None else initial_candidates):
+        candidate = np.asarray(candidate, dtype=float)
+        if candidate.shape != (attempt_count,) or not np.all(np.isfinite(candidate)):
+            raise ValueError("Every initial candidate must contain k finite thresholds.")
+        candidate = np.clip(candidate, lower, upper)
+        retained_starts.append(candidate)
+        candidate_success = attempt_biometric_success(candidate, thresholds, fars, frrs)
+        if candidate_success > best_success:
+            best_thresholds, best_success = candidate.copy(), candidate_success
+
+    one_attempt_success = (1.0 - fars) * (1.0 - frrs)
+    one_attempt_threshold = float(
+        thresholds[int(np.argmax(one_attempt_success))]
+    )
+
+    global_result = differential_evolution(
+        objective,
+        bounds=bounds,
+        seed=seed + attempt_count,
+        popsize=de_popsize,
+        maxiter=de_maxiter,
+        tol=1e-10,
+        polish=False,
+        workers=1,
+        updating="immediate",
+    )
+    global_candidate = np.clip(
+        np.asarray(global_result.x, dtype=float),
+        lower,
+        upper,
+    )
+    global_success = attempt_biometric_success(
+        global_candidate,
+        thresholds,
+        fars,
+        frrs,
+    )
+    if global_success > best_success:
+        best_thresholds = global_candidate
+        best_success = global_success
+
+    # Retained warm starts are followed by the global-search candidate.
+    starts = retained_starts + [global_candidate]
+
+    # Seed equal-threshold starts at the strongest grid candidates. Using
+    # several candidates matters when the empirical success curve has more
+    # than one local maximum.
+    top_count = min(12, len(thresholds))
+    for index in np.argsort(equal_success)[-top_count:][::-1]:
+        starts.append(
+            np.full(attempt_count, float(thresholds[index]))
+        )
+
+    starts.extend(
+        [
+            np.full(attempt_count, one_attempt_threshold),
+            np.full(attempt_count, float(eer_threshold)),
+            np.full(attempt_count, 0.5 * (lower + upper)),
+            np.linspace(lower, upper, attempt_count),
+            np.linspace(lower, upper, attempt_count)[::-1],
+        ]
+    )
+
+    rng = np.random.default_rng(seed + attempt_count)
+    while len(starts) < n_starts:
+        starts.append(rng.uniform(lower, upper, size=attempt_count))
+
+    # Limit local refinements; equal-grid and warm-start objective values
+    # have already been retained even if their local refinement is omitted.
+    starts = starts[:n_starts]
+    successful_runs = 0
+    boundary_failures = 0
+
+    for initial in starts:
+        try:
+            result = minimize(
+                lambda x: attempt_biometric_objective_with_gradient(
+                    x, thresholds, fars, frrs,
+                ),
+                x0=np.clip(initial, lower, upper),
+                jac=True,
+                method="L-BFGS-B",
+                bounds=bounds,
+                options={
+                    "maxiter": 2000,
+                    "ftol": 1e-15,
+                    "gtol": 1e-10,
+                    "maxls": 50,
+                },
+            )
+        except ValueError as exc:
+            if 'violates bound constraints' not in str(exc):
+                raise
+            boundary_failures += 1
+            print(f'[optimizer] k={attempt_count}: skipped a local refinement '
+                  'with a SciPy bounds error; best feasible candidate retained.',
+                  flush=True)
+            continue
+        successful_runs += int(result.success)
+
+        candidate = np.clip(np.asarray(result.x, dtype=float), lower, upper)
+        candidate_success = attempt_biometric_success(
+            candidate,
+            thresholds,
+            fars,
+            frrs,
+        )
+        if candidate_success > best_success:
+            best_thresholds = candidate
+            best_success = candidate_success
+
+    # Sorting only standardizes display. It cannot change the objective,
+    # because every attempt enters the success formula symmetrically.
+    best_thresholds = np.sort(best_thresholds)
+
+    diagnostics = {
+        "method": "differential evolution + multi-start L-BFGS-B",
+        "starts": len(starts),
+        "local_boundary_failures": boundary_failures,
+        "gradient": "analytic derivative of the interpolated FAR/FRR model",
+        "successful_runs": successful_runs,
+        "global_run_converged": bool(global_result.success),
+        "equal_grid_threshold": float(thresholds[equal_index]),
+        "equal_grid_success": float(equal_success[equal_index]),
+    }
+    return best_thresholds, best_success, diagnostics
+
+
+def optimize_user_attacker_thresholds(
+    thresholds: np.ndarray,
+    fars: np.ndarray,
+    frrs: np.ndarray,
+    user_attempts: int,
+    attacker_attempts: int,
+    *,
+    eer_threshold: float,
+    n_starts: int = 64,
+    seed: int = 20260920,
+):
+    """Jointly optimize a distinct threshold for every attempt position."""
+    if user_attempts < 1 or attacker_attempts < 1:
+        raise ValueError("User and attacker attempt counts must be at least 1.")
+    if n_starts < 1:
+        raise ValueError("n_starts must be at least 1.")
+
+    threshold_count = max(user_attempts, attacker_attempts)
+    lower = float(thresholds[0])
+    upper = float(thresholds[-1])
+    bounds = [(lower, upper)] * threshold_count
+
+    def policy_success(candidate_thresholds):
+        return user_attacker_policy_success(
+            candidate_thresholds,
+            thresholds,
+            fars,
+            frrs,
+            user_attempts,
+            attacker_attempts,
+        )
+
+    def objective(candidate_thresholds):
+        bounded_thresholds = np.clip(
+            np.asarray(candidate_thresholds, dtype=float),
+            lower,
+            upper,
+        )
+        return -policy_success(bounded_thresholds)
+
+    # SciPy 1.9 can let its automatic finite-difference probe drift a few
+    # floating-point units outside L-BFGS-B bounds. Supplying a bounded
+    # finite-difference gradient avoids that version-specific failure.
+    gradient_step = max((upper - lower) * 1e-6, 1e-8)
+
+    def objective_gradient(candidate_thresholds):
+        center = np.clip(
+            np.asarray(candidate_thresholds, dtype=float),
+            lower,
+            upper,
+        )
+        gradient = np.zeros_like(center)
+        for index in range(center.size):
+            left_value = max(lower, center[index] - gradient_step)
+            right_value = min(upper, center[index] + gradient_step)
+            denominator = right_value - left_value
+            if denominator <= 0.0:
+                continue
+            left = center.copy()
+            right = center.copy()
+            left[index] = left_value
+            right[index] = right_value
+            gradient[index] = (
+                objective(right) - objective(left)
+            ) / denominator
+        return gradient
+
+    # Retain the best common-threshold policy as a guaranteed baseline, but
+    # do not constrain the optimizer to that baseline.
+    equal_success = user_attacker_success_curve(
+        fars,
+        frrs,
+        user_attempts,
+        attacker_attempts,
+    )
+    equal_index = int(np.argmax(equal_success))
+    best_thresholds = np.full(
+        threshold_count,
+        float(thresholds[equal_index]),
+    )
+    best_success = float(equal_success[equal_index])
+
+    pair_seed = seed + 1009 * user_attempts + 9176 * attacker_attempts
+    global_result = differential_evolution(
+        objective,
+        bounds=bounds,
+        seed=pair_seed,
+        popsize=20,
+        maxiter=500,
+        tol=1e-10,
+        polish=False,
+        workers=1,
+        updating="immediate",
+    )
+    global_candidate = np.clip(
+        np.asarray(global_result.x, dtype=float),
+        lower,
+        upper,
+    )
+    global_success = policy_success(global_candidate)
+    if global_success > best_success:
+        best_thresholds = global_candidate
+        best_success = global_success
+
+    starts = [global_candidate]
+    top_count = min(12, len(thresholds))
+    for index in np.argsort(equal_success)[-top_count:][::-1]:
+        starts.append(
+            np.full(threshold_count, float(thresholds[index]))
+        )
+    starts.extend(
+        [
+            np.full(threshold_count, float(eer_threshold)),
+            np.full(threshold_count, 0.5 * (lower + upper)),
+            np.linspace(lower, upper, threshold_count),
+            np.linspace(lower, upper, threshold_count)[::-1],
+        ]
+    )
+
+    rng = np.random.default_rng(pair_seed)
+    while len(starts) < n_starts:
+        starts.append(rng.uniform(lower, upper, size=threshold_count))
+    starts = starts[:n_starts]
+
+    successful_runs = 0
+    for initial in starts:
+        result = minimize(
+            objective,
+            x0=np.clip(initial, lower, upper),
+            method="L-BFGS-B",
+            jac=objective_gradient,
+            bounds=bounds,
+            options={
+                "maxiter": 2000,
+                "ftol": 1e-15,
+                "gtol": 1e-10,
+                "maxls": 50,
+            },
+        )
+        successful_runs += int(result.success)
+        candidate = np.clip(
+            np.asarray(result.x, dtype=float),
+            lower,
+            upper,
+        )
+        candidate_success = policy_success(candidate)
+        if candidate_success > best_success:
+            best_thresholds = candidate
+            best_success = candidate_success
+
+    diagnostics = {
+        "method": "differential evolution + multi-start L-BFGS-B",
+        "starts": len(starts),
+        "successful_runs": successful_runs,
+        "global_run_converged": bool(global_result.success),
+        "equal_grid_threshold": float(thresholds[equal_index]),
+        "equal_grid_success": float(equal_success[equal_index]),
+    }
+    return best_thresholds, best_success, diagnostics
+
+
+def optimize_user_mean_attempts_with_success_constraint(
+    thresholds: np.ndarray,
+    fars: np.ndarray,
+    frrs: np.ndarray,
+    user_attempts: int,
+    attacker_attempts: int,
+    *,
+    minimum_success_probability: float,
+    eer_threshold: float,
+    n_starts: int = 64,
+    seed: int = 20260929,
+):
+    """Minimize E[N_U | N_U <= k_u] subject to P_success >= P'."""
+    if user_attempts < 1 or attacker_attempts < 1:
+        raise ValueError("User and attacker attempt counts must be at least 1.")
+    if not 0.0 < minimum_success_probability <= 1.0:
+        raise ValueError(
+            "minimum_success_probability must be in the interval (0, 1]."
+        )
+    if n_starts < 1:
+        raise ValueError("n_starts must be at least 1.")
+
+    threshold_count = max(user_attempts, attacker_attempts)
+    lower = float(thresholds[0])
+    upper = float(thresholds[-1])
+    bounds = [(lower, upper)] * threshold_count
+
+    def bounded(candidate_thresholds):
+        return np.clip(
+            np.asarray(candidate_thresholds, dtype=float),
+            lower,
+            upper,
+        )
+
+    def policy_success(candidate_thresholds):
+        return user_attacker_policy_success(
+            bounded(candidate_thresholds),
+            thresholds,
+            fars,
+            frrs,
+            user_attempts,
+            attacker_attempts,
+        )
+
+    def objective(candidate_thresholds):
+        return conditional_user_mean_attempts(
+            bounded(candidate_thresholds),
+            thresholds,
+            frrs,
+            user_attempts,
+        )
+
+    def success_constraint(candidate_thresholds):
+        return policy_success(candidate_thresholds) - minimum_success_probability
+
+    # First maximize P_success. This both checks whether the requested P' is
+    # feasible and supplies a guaranteed feasible starting policy.
+    maximum_thresholds, maximum_success, maximum_diagnostics = (
+        optimize_user_attacker_thresholds(
+            thresholds,
+            fars,
+            frrs,
+            user_attempts,
+            attacker_attempts,
+            eer_threshold=eer_threshold,
+            n_starts=n_starts,
+            seed=seed,
+        )
+    )
+    feasibility_tolerance = 0
+    if maximum_success < minimum_success_probability - feasibility_tolerance:
+        raise ValueError(
+            "The requested success-probability constraint is infeasible: "
+            f"P'={minimum_success_probability:.10f}, but the largest found "
+            f"P_success is {maximum_success:.10f}."
+        )
+
+    best_thresholds = bounded(maximum_thresholds)
+    best_mean = objective(best_thresholds)
+    best_success = policy_success(best_thresholds)
+
+    # A penalized global search supplies another useful starting point. The
+    # final constrained SLSQP runs below enforce the actual inequality.
+    penalty_weight = 1e5
+
+    def penalized_objective(candidate_thresholds):
+        deficit = max(0.0, -success_constraint(candidate_thresholds))
+        return objective(candidate_thresholds) + penalty_weight * deficit
+
+    global_result = differential_evolution(
+        penalized_objective,
+        bounds=bounds,
+        seed=seed + 7919 * user_attempts + 104729 * attacker_attempts,
+        popsize=20,
+        maxiter=500,
+        tol=1e-10,
+        polish=False,
+        workers=1,
+        updating="immediate",
+    )
+    global_candidate = bounded(global_result.x)
+
+    starts = [best_thresholds, global_candidate]
+
+    # Add feasible common-threshold policies, ordered by their conditional
+    # user mean, followed by the EER threshold and randomized starts.
+    equal_success = user_attacker_success_curve(
+        fars,
+        frrs,
+        user_attempts,
+        attacker_attempts,
+    )
+    feasible_equal_indices = np.flatnonzero(
+        equal_success >= minimum_success_probability
+    )
+    feasible_equal_indices = sorted(
+        feasible_equal_indices,
+        key=lambda index: conditional_user_mean_attempts(
+            np.full(threshold_count, float(thresholds[index])),
+            thresholds,
+            frrs,
+            user_attempts,
+        ),
+    )
+    for index in feasible_equal_indices[:12]:
+        starts.append(
+            np.full(threshold_count, float(thresholds[index]))
+        )
+    starts.append(np.full(threshold_count, float(eer_threshold)))
+
+    rng = np.random.default_rng(seed)
+    threshold_span = upper - lower
+    while len(starts) < n_starts:
+        if len(starts) % 2 == 0:
+            candidate = best_thresholds + rng.normal(
+                0.0,
+                0.08 * threshold_span,
+                size=threshold_count,
+            )
+        else:
+            candidate = rng.uniform(lower, upper, size=threshold_count)
+        starts.append(bounded(candidate))
+    starts = starts[:n_starts]
+
+    successful_runs = 0
+    feasible_runs = 0
+    constraint = {"type": "ineq", "fun": success_constraint}
+    for initial in starts:
+        result = minimize(
+            objective,
+            x0=bounded(initial),
+            method="SLSQP",
+            bounds=bounds,
+            constraints=[constraint],
+            options={
+                "maxiter": 4000,
+                "ftol": 1e-12,
+                "disp": False,
+            },
+        )
+        successful_runs += int(result.success)
+        candidate = bounded(result.x)
+        candidate_success = policy_success(candidate)
+        candidate_mean = objective(candidate)
+        is_feasible = (
+            candidate_success
+            >= minimum_success_probability - feasibility_tolerance
+        )
+        feasible_runs += int(is_feasible)
+        if is_feasible and candidate_mean < best_mean:
+            best_thresholds = candidate
+            best_mean = candidate_mean
+            best_success = candidate_success
+
+    diagnostics = {
+        "method": "penalized differential evolution + multi-start SLSQP",
+        "starts": len(starts),
+        "successful_runs": successful_runs,
+        "feasible_runs": feasible_runs,
+        "global_run_converged": bool(global_result.success),
+        "maximum_success": float(maximum_success),
+        "maximum_success_optimizer": maximum_diagnostics["method"],
+        "constraint_value": float(minimum_success_probability),
+        "constraint_slack": float(
+            best_success - minimum_success_probability
+        ),
+    }
+    return best_thresholds, best_mean, diagnostics
+
+
+def optimize_user_mean_attempts_with_separate_constraints(
+    thresholds: np.ndarray,
+    fars: np.ndarray,
+    frrs: np.ndarray,
+    user_attempts: int,
+    attacker_attempts: int,
+    *,
+    minimum_user_success_probability: float,
+    minimum_attacker_rejection_probability: float,
+    eer_threshold: float,
+    n_starts: int = 64,
+    seed: int = 20260929,
+):
+    """Minimize E[N_U | success] subject to two separate probabilities."""
+    if user_attempts < 1 or attacker_attempts < 1:
+        raise ValueError("User and attacker attempt counts must be at least 1.")
+    if not 0.0 < minimum_user_success_probability <= 1.0:
+        raise ValueError(
+            "minimum_user_success_probability must be in (0, 1]."
+        )
+    if not 0.0 < minimum_attacker_rejection_probability <= 1.0:
+        raise ValueError(
+            "minimum_attacker_rejection_probability must be in (0, 1]."
+        )
+    if n_starts < 1:
+        raise ValueError("n_starts must be at least 1.")
+
+    threshold_count = max(user_attempts, attacker_attempts)
+    lower = float(thresholds[0])
+    upper = float(thresholds[-1])
+    bounds = [(lower, upper)] * threshold_count
+    feasibility_tolerance = 1e-9
+
+    def bounded(candidate_thresholds):
+        return np.clip(
+            np.asarray(candidate_thresholds, dtype=float),
+            lower,
+            upper,
+        )
+
+    def probabilities(candidate_thresholds):
+        return user_attacker_policy_probabilities(
+            bounded(candidate_thresholds),
+            thresholds,
+            fars,
+            frrs,
+            user_attempts,
+            attacker_attempts,
+        )
+
+    def objective(candidate_thresholds):
+        value = conditional_user_mean_attempts(
+            bounded(candidate_thresholds),
+            thresholds,
+            frrs,
+            user_attempts,
+        )
+        return value if np.isfinite(value) else 1e12
+
+    def user_constraint(candidate_thresholds):
+        p_user_success, _ = probabilities(candidate_thresholds)
+        return p_user_success - minimum_user_success_probability
+
+    def attacker_constraint(candidate_thresholds):
+        _, p_attacker_rejected = probabilities(candidate_thresholds)
+        return (
+            p_attacker_rejected
+            - minimum_attacker_rejection_probability
+        )
+
+    def constraint_violation(candidate_thresholds):
+        user_deficit = max(0.0, -user_constraint(candidate_thresholds))
+        attacker_deficit = max(
+            0.0,
+            -attacker_constraint(candidate_thresholds),
+        )
+        return user_deficit**2 + attacker_deficit**2
+
+    pair_seed = seed + 7919 * user_attempts + 104729 * attacker_attempts
+
+    # Search globally for a policy satisfying both constraints. This is also
+    # the feasibility check and the first constrained-optimizer start.
+    feasibility_result = differential_evolution(
+        constraint_violation,
+        bounds=bounds,
+        seed=pair_seed,
+        popsize=20,
+        maxiter=500,
+        tol=1e-12,
+        polish=True,
+        workers=1,
+        updating="immediate",
+    )
+    feasibility_candidate = bounded(feasibility_result.x)
+
+    penalty_weight = 1e6
+
+    def penalized_objective(candidate_thresholds):
+        return (
+            objective(candidate_thresholds)
+            + penalty_weight * constraint_violation(candidate_thresholds)
+        )
+
+    global_result = differential_evolution(
+        penalized_objective,
+        bounds=bounds,
+        seed=pair_seed + 1,
+        popsize=20,
+        maxiter=500,
+        tol=1e-10,
+        polish=False,
+        workers=1,
+        updating="immediate",
+    )
+    starts = [feasibility_candidate, bounded(global_result.x)]
+
+    equal_user_success = 1.0 - np.power(frrs, user_attempts)
+    equal_attacker_rejection = np.power(
+        1.0 - fars,
+        attacker_attempts,
+    )
+    feasible_equal_indices = np.flatnonzero(
+        (equal_user_success >= minimum_user_success_probability)
+        & (
+            equal_attacker_rejection
+            >= minimum_attacker_rejection_probability
+        )
+    )
+    feasible_equal_indices = sorted(
+        feasible_equal_indices,
+        key=lambda index: objective(
+            np.full(threshold_count, float(thresholds[index]))
+        ),
+    )
+    for index in feasible_equal_indices[:12]:
+        starts.append(
+            np.full(threshold_count, float(thresholds[index]))
+        )
+
+    starts.extend(
+        [
+            np.full(threshold_count, float(eer_threshold)),
+            np.full(threshold_count, lower),
+            np.full(threshold_count, upper),
+            np.linspace(lower, upper, threshold_count),
+            np.linspace(lower, upper, threshold_count)[::-1],
+        ]
+    )
+
+    rng = np.random.default_rng(seed)
+    threshold_span = upper - lower
+    while len(starts) < n_starts:
+        if len(starts) % 2 == 0:
+            candidate = feasibility_candidate + rng.normal(
+                0.0,
+                0.08 * threshold_span,
+                size=threshold_count,
+            )
+        else:
+            candidate = rng.uniform(lower, upper, size=threshold_count)
+        starts.append(bounded(candidate))
+    starts = starts[:n_starts]
+
+    constraints = [
+        {"type": "ineq", "fun": user_constraint},
+        {"type": "ineq", "fun": attacker_constraint},
+    ]
+    best_thresholds = None
+    best_mean = float("inf")
+    best_probabilities = None
+    successful_runs = 0
+    feasible_runs = 0
+
+    for initial in starts:
+        result = minimize(
+            objective,
+            x0=bounded(initial),
+            method="SLSQP",
+            bounds=bounds,
+            constraints=constraints,
+            options={
+                "maxiter": 4000,
+                "ftol": 1e-12,
+                "disp": False,
+            },
+        )
+        successful_runs += int(result.success)
+        candidate = bounded(result.x)
+        p_user_success, p_attacker_rejected = probabilities(candidate)
+        candidate_mean = objective(candidate)
+        is_feasible = (
+            p_user_success
+            >= minimum_user_success_probability - feasibility_tolerance
+            and p_attacker_rejected
+            >= minimum_attacker_rejection_probability
+            - feasibility_tolerance
+        )
+        feasible_runs += int(is_feasible)
+        if is_feasible and candidate_mean < best_mean:
+            best_thresholds = candidate
+            best_mean = candidate_mean
+            best_probabilities = (
+                p_user_success,
+                p_attacker_rejected,
+            )
+
+    if best_thresholds is None:
+        p_user_found, p_attacker_found = probabilities(
+            feasibility_candidate
+        )
+        raise ValueError(
+            "The separate probability constraints appear infeasible: "
+            f"required user success >= "
+            f"{minimum_user_success_probability:.10f} and attacker "
+            f"rejection >= {minimum_attacker_rejection_probability:.10f}; "
+            f"the closest global feasibility candidate found user success "
+            f"{p_user_found:.10f} and attacker rejection "
+            f"{p_attacker_found:.10f}."
+        )
+
+    p_user_success, p_attacker_rejected = best_probabilities
+    diagnostics = {
+        "method": "feasibility search + penalized differential evolution + multi-start SLSQP",
+        "starts": len(starts),
+        "successful_runs": successful_runs,
+        "feasible_runs": feasible_runs,
+        "feasibility_run_converged": bool(feasibility_result.success),
+        "global_run_converged": bool(global_result.success),
+        "minimum_user_success_probability": float(
+            minimum_user_success_probability
+        ),
+        "minimum_attacker_rejection_probability": float(
+            minimum_attacker_rejection_probability
+        ),
+        "user_success_constraint_slack": float(
+            p_user_success - minimum_user_success_probability
+        ),
+        "attacker_rejection_constraint_slack": float(
+            p_attacker_rejected
+            - minimum_attacker_rejection_probability
+        ),
+    }
+    return best_thresholds, best_mean, diagnostics
+
+
+def optimize_remaining_thresholds_with_fixed_prefix(
+    fixed_thresholds,
+    thresholds: np.ndarray,
+    fars: np.ndarray,
+    frrs: np.ndarray,
+    remaining_count: int,
+    *,
+    eer_threshold: float,
+    n_starts: int = 64,
+    seed: int = 20260827,
+):
+    """Optimize unused thresholds in the full fixed-prefix mechanism."""
+    if remaining_count < 1:
+        raise ValueError("remaining_count must be at least 1.")
+    if n_starts < 1:
+        raise ValueError("n_starts must be at least 1.")
+
+    fixed_thresholds = np.asarray(fixed_thresholds, dtype=float)
+    if fixed_thresholds.ndim != 1:
+        raise ValueError("fixed_thresholds must be one-dimensional.")
+
+    lower = float(thresholds[0])
+    upper = float(thresholds[-1])
+    bounds = [(lower, upper)] * remaining_count
+
+    def success(candidate_thresholds):
+        full_thresholds = np.concatenate(
+            (fixed_thresholds, np.asarray(candidate_thresholds, dtype=float))
+        )
+        return attempt_biometric_success(
+            full_thresholds,
+            thresholds,
+            fars,
+            frrs,
+        )
+
+    def objective(candidate_thresholds):
+        return -success(candidate_thresholds)
+
+    # Keep the best equal-threshold remainder as a deterministic baseline.
+    equal_success = np.asarray(
+        [success(np.full(remaining_count, threshold)) for threshold in thresholds]
+    )
+    equal_index = int(np.argmax(equal_success))
+    best_thresholds = np.full(
+        remaining_count,
+        float(thresholds[equal_index]),
+    )
+    best_success = float(equal_success[equal_index])
+
+    global_result = differential_evolution(
+        objective,
+        bounds=bounds,
+        seed=seed + len(fixed_thresholds) + remaining_count,
+        popsize=20,
+        maxiter=500,
+        tol=1e-10,
+        polish=False,
+        workers=1,
+        updating="immediate",
+    )
+    global_candidate = np.clip(
+        np.asarray(global_result.x, dtype=float),
+        lower,
+        upper,
+    )
+    global_success = success(global_candidate)
+    if global_success > best_success:
+        best_thresholds = global_candidate
+        best_success = global_success
+
+    starts = [global_candidate]
+    top_count = min(12, len(thresholds))
+    for index in np.argsort(equal_success)[-top_count:][::-1]:
+        starts.append(
+            np.full(remaining_count, float(thresholds[index]))
+        )
+    starts.extend(
+        [
+            np.full(remaining_count, float(eer_threshold)),
+            np.full(remaining_count, 0.5 * (lower + upper)),
+            np.linspace(lower, upper, remaining_count),
+            np.linspace(lower, upper, remaining_count)[::-1],
+        ]
+    )
+
+    rng = np.random.default_rng(
+        seed + len(fixed_thresholds) + remaining_count
+    )
+    while len(starts) < n_starts:
+        starts.append(rng.uniform(lower, upper, size=remaining_count))
+
+    successful_runs = 0
+    for initial in starts[:n_starts]:
+        result = minimize(
+            objective,
+            x0=np.clip(initial, lower, upper),
+            method="L-BFGS-B",
+            bounds=bounds,
+            options={
+                "maxiter": 2000,
+                "ftol": 1e-15,
+                "gtol": 1e-10,
+                "maxls": 50,
+            },
+        )
+        successful_runs += int(result.success)
+        candidate = np.clip(np.asarray(result.x, dtype=float), lower, upper)
+        candidate_success = success(candidate)
+        if candidate_success > best_success:
+            best_thresholds = candidate
+            best_success = candidate_success
+
+    # The unused attempts are exchangeable. Sorting defines a deterministic
+    # order, and the lowest optimized threshold is applied next.
+    best_thresholds = np.sort(best_thresholds)
+    diagnostics = {
+        "method": "differential evolution + multi-start L-BFGS-B",
+        "starts": min(len(starts), n_starts),
+        "successful_runs": successful_runs,
+        "global_run_converged": bool(global_result.success),
+    }
+    return best_thresholds, best_success, diagnostics
+
+
+def optimize_fixed_prefix_attempt_policy(
+    thresholds: np.ndarray,
+    fars: np.ndarray,
+    frrs: np.ndarray,
+    attempt_count: int,
+    *,
+    eer_threshold: float,
+    n_starts: int = 64,
+):
+    """Re-optimize the full k-attempt mechanism after each rejection."""
+    if attempt_count < 1:
+        raise ValueError("attempt_count must be at least 1.")
+
+    selected_thresholds = []
+    policy = []
+    for attempt_number in range(1, attempt_count + 1):
+        remaining_count = attempt_count - attempt_number + 1
+        optimized_remainder, full_success, diagnostics = (
+            optimize_remaining_thresholds_with_fixed_prefix(
+                selected_thresholds,
+                thresholds,
+                fars,
+                frrs,
+                remaining_count,
+                eer_threshold=eer_threshold,
+                n_starts=n_starts,
+            )
+        )
+        applied_threshold = float(optimized_remainder[0])
+        selected_thresholds.append(applied_threshold)
+        current_success = attempt_biometric_success(
+            selected_thresholds,
+            thresholds,
+            fars,
+            frrs,
+        )
+        policy.append(
+            {
+                "attempt_number": attempt_number,
+                "attempts_remaining": remaining_count,
+                "threshold": applied_threshold,
+                "far": float(np.interp(applied_threshold, thresholds, fars)),
+                "frr": float(np.interp(applied_threshold, thresholds, frrs)),
+                "optimized_remainder": optimized_remainder,
+                "full_horizon_success": full_success,
+                "current_success": current_success,
+                "optimizer_diagnostics": diagnostics,
+            }
+        )
+
+    return policy, float(policy[-1]["current_success"])
+
+
+def export_attempt_success_curves(
+    thresholds: np.ndarray,
+    fars: np.ndarray,
+    frrs: np.ndarray,
+    attempt_counts,
+    out_file: Path = ATTEMPTS_SUCCESS_DATA,
+) -> None:
+    """
+    Export TikZ-ready equal-threshold success curves.
+
+    Each success_kN column evaluates the full k-attempt success formula with
+    t1 = ... = tk = threshold. Joint k-dimensional optima are printed by
+    run_attempt_comparisons; a k-dimensional surface cannot be represented by
+    one x column once k is greater than two.
+    """
+    attempt_counts = list(dict.fromkeys(int(k) for k in attempt_counts))
+    if not attempt_counts or any(k < 1 for k in attempt_counts):
+        raise ValueError("attempt_counts must contain positive integers.")
+
+    curves = {
+        k: equal_threshold_success_curve(
+            thresholds,
+            fars,
+            frrs,
+            k,
+        )
+        for k in attempt_counts
+    }
+
+    out_file = Path(out_file)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    with out_file.open("w", newline="") as handle:
+        writer = csv.writer(handle, delimiter=" ", lineterminator="\n")
+        writer.writerow(
+            ["threshold"] + [f"success_k{k}" for k in attempt_counts]
+        )
+        for index, threshold in enumerate(thresholds):
+            writer.writerow(
+                [f"{float(threshold):.6f}"]
+                + [f"{float(curves[k][index]):.10f}" for k in attempt_counts]
+            )
+
+
+def run_attempt_comparisons(
+    thresholds: np.ndarray,
+    fars: np.ndarray,
+    frrs: np.ndarray,
+    eer_threshold: float,
+    *,
+    attempt_counts=(2, 4, 6),
+    optimizer_starts: int = 64,
+    success_data_file: Path = ATTEMPTS_SUCCESS_DATA,
+):
+    """Optimize and print the biometric-only comparison for each requested k."""
+    attempt_counts = list(dict.fromkeys(int(k) for k in attempt_counts))
+    if not attempt_counts or any(k < 1 for k in attempt_counts):
+        raise ValueError("Every attempt count must be a positive integer.")
+
+    one_attempt_success = (1.0 - fars) * (1.0 - frrs)
+    one_attempt_index = int(np.argmax(one_attempt_success))
+    one_attempt_optimal_threshold = float(thresholds[one_attempt_index])
+    results = []
+
+    print("\n" + "=" * 80)
+    print("[PARAMETRIC BIOMETRIC-ONLY ATTEMPT COMPARISON]")
+    print("=" * 80)
+
+    for attempt_count in attempt_counts:
+        joint_thresholds, p_joint, diagnostics = optimize_attempt_thresholds(
+            thresholds,
+            fars,
+            frrs,
+            attempt_count,
+            eer_threshold=eer_threshold,
+            n_starts=optimizer_starts,
+        )
+
+        one_attempt_policy_thresholds = np.full(
+            attempt_count,
+            one_attempt_optimal_threshold,
+        )
+        p_one_attempt_threshold = attempt_biometric_success(
+            one_attempt_policy_thresholds,
+            thresholds,
+            fars,
+            frrs,
+        )
+
+        eer_policy_thresholds = np.full(
+            attempt_count,
+            float(eer_threshold),
+        )
+        p_eer_threshold = attempt_biometric_success(
+            eer_policy_thresholds,
+            thresholds,
+            fars,
+            frrs,
+        )
+
+        threshold_spread = float(np.ptp(joint_thresholds))
+        print(f"\n[k = {attempt_count} attempts]")
+        print(
+            "[i] Joint optimization: "
+            f"{diagnostics['method']}, "
+            f"{diagnostics['successful_runs']}/{diagnostics['starts']} "
+            "runs converged"
+        )
+        for index, threshold in enumerate(joint_thresholds, start=1):
+            print(f"    t{index} = {threshold:.6f}")
+        print(f"    threshold spread = {threshold_spread:.6e}")
+        print(f"    P_success = {p_joint:.10f}")
+
+        print("[i] One-attempt optimum reused for all attempts:")
+        print(f"    t = {one_attempt_optimal_threshold:.6f}")
+        print(f"    P_success = {p_one_attempt_threshold:.10f}")
+
+        print("[i] EER threshold reused for all attempts:")
+        print(f"    t = {eer_threshold:.6f}")
+        print(f"    P_success = {p_eer_threshold:.10f}")
+
+        results.append(
+            {
+                "attempt_count": attempt_count,
+                "joint_thresholds": joint_thresholds,
+                "joint_success": p_joint,
+                "threshold_spread": threshold_spread,
+                "one_attempt_threshold": one_attempt_optimal_threshold,
+                "one_attempt_policy_success": p_one_attempt_threshold,
+                "eer_threshold": float(eer_threshold),
+                "eer_policy_success": p_eer_threshold,
+                "optimizer_diagnostics": diagnostics,
+            }
+        )
+
+    export_attempt_success_curves(
+        thresholds,
+        fars,
+        frrs,
+        attempt_counts,
+        success_data_file,
+    )
+    print(f"\n[i] Attempts success-function data saved to: {success_data_file}")
+    return results
+
+
+def run_sequential_attempt_comparisons(
+    thresholds: np.ndarray,
+    fars: np.ndarray,
+    frrs: np.ndarray,
+    *,
+    attempt_counts=(2, 4, 6),
+):
+    """Print forward greedy threshold policies from saved biometric data."""
+    attempt_counts = list(dict.fromkeys(int(k) for k in attempt_counts))
+    if not attempt_counts or any(k < 1 for k in attempt_counts):
+        raise ValueError("Every attempt count must be a positive integer.")
+
+    results = []
+    print("\n" + "=" * 80)
+    print("[SEQUENTIAL GREEDY BIOMETRIC THRESHOLD POLICY]")
+    print("=" * 80)
+
+    for attempt_count in attempt_counts:
+        policy, policy_success = optimize_sequential_attempt_policy(
+            thresholds,
+            fars,
+            frrs,
+            attempt_count,
+        )
+
+        print(f"\n[k = {attempt_count} maximum attempts]")
+        for row in policy:
+            print(
+                f"[i] Attempt {row['attempt_number']}: "
+                f"threshold = {row['threshold']:.6f}, "
+                f"FAR = {row['far']:.10f}, "
+                f"FRR = {row['frr']:.10f}, "
+                f"cumulative P_success = "
+                f"{row['cumulative_success']:.10f}"
+            )
+        print(f"[i] Policy P_success = {policy_success:.10f}")
+
+        results.append(
+            {
+                "attempt_count": attempt_count,
+                "policy": policy,
+                "policy_success": policy_success,
+            }
+        )
+
+    return results
+
+
+def run_fixed_prefix_attempt_comparisons(
+    thresholds: np.ndarray,
+    fars: np.ndarray,
+    frrs: np.ndarray,
+    eer_threshold: float,
+    *,
+    attempt_counts=(2, 4, 6),
+    optimizer_starts: int = 64,
+    tikz_data_file: Path = None,
+):
+    """Print fixed-prefix policies and optionally export their final rows."""
+    attempt_counts = list(dict.fromkeys(int(k) for k in attempt_counts))
+    if not attempt_counts or any(k < 1 for k in attempt_counts):
+        raise ValueError("Every attempt count must be a positive integer.")
+
+    one_attempt_success = (1.0 - fars) * (1.0 - frrs)
+    one_attempt_index = int(np.argmax(one_attempt_success))
+    one_attempt_optimal_threshold = float(thresholds[one_attempt_index])
+
+    results = []
+    print("\n" + "=" * 80)
+    print("[FULL-HORIZON FIXED-PREFIX BIOMETRIC THRESHOLD POLICY]")
+    print("=" * 80)
+
+    for attempt_count in attempt_counts:
+        policy, policy_success = optimize_fixed_prefix_attempt_policy(
+            thresholds,
+            fars,
+            frrs,
+            attempt_count,
+            eer_threshold=eer_threshold,
+            n_starts=optimizer_starts,
+        )
+
+        p_success_eer = attempt_biometric_success(
+            np.full(attempt_count, float(eer_threshold)),
+            thresholds,
+            fars,
+            frrs,
+        )
+        p_success_single_attempt_optimum = attempt_biometric_success(
+            np.full(attempt_count, one_attempt_optimal_threshold),
+            thresholds,
+            fars,
+            frrs,
+        )
+
+        print(f"\n[k = {attempt_count} maximum attempts]")
+        for row in policy:
+            remainder = ", ".join(
+                f"{threshold:.6f}"
+                for threshold in row["optimized_remainder"]
+            )
+            print(
+                f"[i] Attempt {row['attempt_number']}: "
+                f"optimized remainder = [{remainder}]"
+            )
+            print(
+                f"    applied threshold = {row['threshold']:.6f}, "
+                f"FAR = {row['far']:.10f}, "
+                f"FRR = {row['frr']:.10f}, "
+                f"current P_success = {row['current_success']:.10f}"
+            )
+
+        results.append(
+            {
+                "attempt_count": attempt_count,
+                "policy": policy,
+                "policy_success": policy_success,
+                "p_success_eer": p_success_eer,
+                "p_success_single_attempt_optimum": (
+                    p_success_single_attempt_optimum
+                ),
+            }
+        )
+
+    if tikz_data_file is not None:
+        export_fixed_prefix_tikz_data(results, tikz_data_file)
+        print(f"\n[i] Fixed-prefix TikZ data saved to: {tikz_data_file}")
+
+    return results
+
+
+def export_fixed_prefix_tikz_data(results, out_file: Path) -> None:
+    """
+    Export one TikZ-ready row per maximum attempt count k.
+
+    For each k, FAR and FRR are taken from the threshold applied on the last
+    attempt of that k-attempt policy. P_success_max is the cumulative success
+    probability after that last attempt. The export also contains
+    product_FRR = product_{j=1}^k FRR_j and product_1_minus_FAR =
+    product_{j=1}^k (1 - FAR_j). For example, the k=4 row uses the FAR, FRR,
+    and current_success values stored in policy[3], while both products use
+    all four policy rows. P_success_EER reuses the EER threshold for all k
+    attempts, and P_success_single_attempt_optimum reuses the one-attempt
+    optimal threshold for all k attempts. Threshold is the applied last-attempt
+    threshold t_k of that k-attempt policy. Threshold_1 ... Threshold_max_k
+    retain each policy's complete applied sequence; unused entries are nan.
+    Each row is a separate horizon, not a prefix of a common longest policy.
+    """
+    if not results:
+        raise ValueError("No fixed-prefix results are available to export.")
+
+    max_attempt_count = max(int(result["attempt_count"]) for result in results)
+    output_rows = []
+    for result in results:
+        attempt_count = int(result["attempt_count"])
+        policy = result["policy"]
+        if not policy:
+            raise ValueError(
+                f"The fixed-prefix policy for k={attempt_count} is empty."
+            )
+
+        if len(policy) != attempt_count or [
+            int(row["attempt_number"]) for row in policy
+        ] != list(range(1, attempt_count + 1)):
+            raise ValueError(f"Expected consecutive attempts 1 through {attempt_count}.")
+        applied_thresholds = [float(row["threshold"]) for row in policy]
+        if not np.all(np.isfinite(applied_thresholds)):
+            raise ValueError(f"Nonfinite applied thresholds for k={attempt_count}.")
+        padded_thresholds = applied_thresholds + [float("nan")] * (
+            max_attempt_count - attempt_count
+        )
+
+        final_attempt = policy[-1]
+        if int(final_attempt["attempt_number"]) != attempt_count:
+            raise ValueError(
+                f"The final policy row for k={attempt_count} is attempt "
+                f"{final_attempt['attempt_number']}, not attempt {attempt_count}."
+            )
+
+        product_frr = float(
+            np.prod([float(attempt["frr"]) for attempt in policy])
+        )
+        product_one_minus_far = float(
+            np.prod(
+                [1.0 - float(attempt["far"]) for attempt in policy]
+            )
+        )
+        p_success_max = float(final_attempt["current_success"])
+        p_success_eer = float(result["p_success_eer"])
+        p_success_single_attempt_optimum = float(
+            result["p_success_single_attempt_optimum"]
+        )
+        success_from_products = (
+            (1.0 - product_frr) * product_one_minus_far
+        )
+        if not np.isclose(
+            p_success_max,
+            success_from_products,
+            rtol=1e-9,
+            atol=1e-12,
+        ):
+            raise ValueError(
+                f"The exported products for k={attempt_count} imply "
+                f"P_success={success_from_products:.10f}, but the final "
+                f"policy row contains {p_success_max:.10f}."
+            )
+
+        output_rows.append(
+            (
+                attempt_count,
+                float(final_attempt["far"]),
+                float(final_attempt["frr"]),
+                p_success_max,
+                product_frr,
+                product_one_minus_far,
+                p_success_eer,
+                p_success_single_attempt_optimum,
+                applied_thresholds[-1],
+                *padded_thresholds,
+            )
+        )
+
+    # Ascending k gives pgfplots a correctly ordered x-axis even if the user
+    # supplied --attempts in a different order.
+    output_rows.sort(key=lambda row: row[0])
+
+    out_file = Path(out_file)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    with out_file.open("w", newline="") as handle:
+        writer = csv.writer(handle, delimiter=" ", lineterminator="\n")
+        writer.writerow(
+            [
+                "k",
+                "FAR",
+                "FRR",
+                "P_success_max",
+                "product_FRR",
+                "product_1_minus_FAR",
+                "P_success_EER",
+                "P_success_single_attempt_optimum",
+                "Threshold",
+            ] + [f"Threshold_{j}" for j in range(1, max_attempt_count + 1)]
+        )
+        for row in output_rows:
+            writer.writerow([row[0]] + [f"{value:.10f}" for value in row[1:]])
+
+
+def find_mechanism_success_saturation(success, attempt_count, gain_tolerance=0.01):
+    """Earliest i < m with max_{j>i}|P_success(j)-P_success(i)| <= epsilon.
+
+    Overall success need not be monotone. Check every later prefix, so an
+    intermediate rise or decline cannot be hidden by a similar final value.
+    This is a finite-horizon plateau diagnostic, not a new optimized policy.
+    """
+    values = np.asarray(success, dtype=float)
+    if (not isinstance(attempt_count, (int, np.integer)) or attempt_count < 1
+            or values.ndim != 1 or values.size != attempt_count):
+        raise ValueError('Provide one mechanism-success value per policy attempt.')
+    if not np.isfinite(gain_tolerance) or not 0 <= gain_tolerance <= 1:
+        raise ValueError('Saturation tolerance must be finite and in [0, 1].')
+    if not np.all(np.isfinite(values)) or np.any((values < 0) | (values > 1)):
+        raise ValueError('Mechanism success must be finite and in [0,1].')
+    attempt = None
+    max_change = None
+    for index in range(attempt_count - 1):
+        change = float(np.max(np.abs(values[index + 1:] - values[index])))
+        if change <= gain_tolerance + 1e-12:
+            attempt = index + 1
+            max_change = change
+            break
+    return {
+        'attempt': attempt, 'gain_tolerance': float(gain_tolerance),
+        'attempt_count': int(attempt_count), 'final_success': float(values[-1]),
+        'success_at_saturation': float(values[attempt - 1]) if attempt else None,
+        'maximum_remaining_change': max_change,
+    }
+
+
+def print_mechanism_success_saturation(success, attempt_count, *,
+                                       gain_tolerance=0.01, policy_label='Policy'):
+    """Print overall mechanism saturation, accounting for both players."""
+    info = find_mechanism_success_saturation(success, attempt_count, gain_tolerance)
+    if attempt_count == 1:
+        status = 'not assessable (only one attempt)'
+    elif info['attempt'] is None:
+        status = f'not reached within {attempt_count} attempts'
+    else:
+        status = str(info['attempt'])
+    print(f'[saturation] {policy_label}: overall success saturation attempt = {status}',
+          flush=True)
+    return info
+
+
+def export_attempt_policy_graphs(
+    attempt_thresholds, thresholds, fars, frrs, *,
+    user_attempts, attacker_attempts, output_dir=None,
+    saturation_gain_tolerance=0.01, policy_label="Policy",
+):
+    """Export threshold and cumulative acceptance TXT/TikZ for one fixed policy.
+
+    At attempt i, each probability includes only attempts allowed for that
+    player: P_U(i)=1-product(FRR_j), P_A(i)=1-product(1-FAR_j).
+    A curve remains constant after its player's attempt budget is exhausted.
+    """
+    policy = np.asarray(attempt_thresholds, dtype=float)
+    grid = np.asarray(thresholds, dtype=float)
+    fars = np.asarray(fars, dtype=float)
+    frrs = np.asarray(frrs, dtype=float)
+    if (not isinstance(user_attempts, (int, np.integer))
+            or not isinstance(attacker_attempts, (int, np.integer))
+            or min(user_attempts, attacker_attempts) < 1):
+        raise ValueError('User and attacker attempt limits must be positive integers.')
+    count = max(user_attempts, attacker_attempts)
+    if policy.shape != (count,) or not np.all(np.isfinite(policy)):
+        raise ValueError(f'Exactly {count} finite thresholds are required.')
+    if (grid.ndim != 1 or grid.size < 2
+            or fars.shape != grid.shape or frrs.shape != grid.shape
+            or not np.all(np.isfinite(grid)) or np.any(np.diff(grid) <= 0)
+            or not np.all(np.isfinite(fars)) or not np.all(np.isfinite(frrs))
+            or np.any((fars < 0) | (fars > 1))
+            or np.any((frrs < 0) | (frrs > 1))):
+        raise ValueError('Provide an increasing threshold grid and valid FAR/FRR arrays.')
+    if np.any((policy < grid[0]) | (policy > grid[-1])):
+        raise ValueError('Policy thresholds must lie inside the input threshold grid.')
+    attempts = np.arange(1, count + 1)
+    attempt_fars = np.interp(policy, grid, fars)
+    attempt_frrs = np.interp(policy, grid, frrs)
+    # Multiplication by one leaves a player's cumulative failure unchanged
+    # after its last permitted attempt. Do not grant either player extra attempts.
+    user_failure_factors = np.where(attempts <= user_attempts, attempt_frrs, 1.0)
+    attacker_rejection_factors = np.where(
+        attempts <= attacker_attempts, 1.0 - attempt_fars, 1.0,
+    )
+    user_success = 1.0 - np.cumprod(user_failure_factors)
+    attacker_success = 1.0 - np.cumprod(attacker_rejection_factors)
+    joint_success = user_success * (1.0 - attacker_success)
+    saturation = print_mechanism_success_saturation(
+        joint_success, count, gain_tolerance=saturation_gain_tolerance,
+        policy_label=policy_label,
+    )
+    output_dir = Path(SPOOF_OUTPUT_DIR if output_dir is None else output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    threshold_data = output_dir / 'livdet_threshold_by_attempt.txt'
+    success_data = output_dir / 'livdet_user_attacker_success_by_attempt.txt'
+    np.savetxt(threshold_data, np.column_stack((attempts, policy)),
+               fmt=['%d', '%.17g'], comments='', header='Attempt Threshold')
+    np.savetxt(success_data, np.column_stack((attempts, user_success, attacker_success, joint_success)),
+               fmt=['%d', '%.17g', '%.17g', '%.17g'], comments='',
+               header='Attempt P_user_success P_attacker_success P_success')
+    # Both plots read the new tables; no obsolete threshold/success trajectories.
+    tex = [
+        r'% Preamble: \usepackage{pgfplots}; \pgfplotsset{compat=1.18}',
+        r'% Set \AttemptPolicyDataDir to the folder containing these two TXT files.',
+        r'\providecommand{\AttemptPolicyDataDir}{figs/fig_spoofed_users}',
+        r'\begin{figure}[t]', r'\centering', r'\begin{tikzpicture}',
+        r'\begin{axis}[width=0.9\linewidth,height=0.55\linewidth,',
+        r'xlabel={Attempt},ylabel={Threshold},xtick=data,grid=major]',
+        r'\addplot[blue,thick,mark=o] table[x=Attempt,y=Threshold]',
+        r'{\AttemptPolicyDataDir/livdet_threshold_by_attempt.txt};',
+        r'\end{axis}', r'\end{tikzpicture}',
+        rf'\caption{{Selected thresholds for the optimized policy, with $k_u={user_attempts}$ and $k_a={attacker_attempts}$.}}',
+        r'\label{fig:livdet_threshold_by_attempt}', r'\end{figure}',
+        r'\begin{figure}[t]', r'\centering', r'\begin{tikzpicture}',
+        r'\begin{axis}[width=0.9\linewidth,height=0.55\linewidth,',
+        r'xlabel={Attempt},ylabel={Cumulative success probability},',
+        r'xtick=data,ymin=0,ymax=1,grid=major,legend pos=south east]',
+        r'\addplot[blue,thick,mark=o] table[x=Attempt,y=P_user_success]',
+        r'{\AttemptPolicyDataDir/livdet_user_attacker_success_by_attempt.txt};',
+        r'\addlegendentry{User}',
+        r'\addplot[red,thick,mark=square*] table[x=Attempt,y=P_attacker_success]',
+        r'{\AttemptPolicyDataDir/livdet_user_attacker_success_by_attempt.txt};',
+        r'\addlegendentry{Attacker}',
+        r'\end{axis}', r'\end{tikzpicture}',
+        r'\caption{Probability of at least one acceptance through each attempt.',
+        r'Each curve remains constant after its permitted attempt limit.}',
+        r'\label{fig:livdet_user_attacker_success_by_attempt}', r'\end{figure}',
+    ]
+    tikz_path = output_dir / 'livdet_attempt_policy_graphs.tex'
+    tikz_path.write_text('\n'.join(tex) + '\n')
+    files = {'threshold_data': threshold_data, 'success_data': success_data,
+             'tikz_file': tikz_path}
+    for path in files.values():
+        print(f'[graph] saved {path}', flush=True)
+    return {'attempts': attempts, 'thresholds': policy,
+            'user_success': user_success, 'attacker_success': attacker_success,
+            'joint_success': joint_success, 'mechanism_saturation': saturation, **files}
+
+
+def export_constraint_comparison(results, family, *, output_dir):
+    """Three policies: thresholds above, user/attacker acceptance below.
+
+    All points on a curve use one full-horizon optimized policy; no policy
+    is re-optimized at intermediate x-axis attempts.
+    """
+    if family not in {'success_constraints', 'mean_limits'} or not results:
+        raise ValueError('Provide a supported comparison family and nonempty results.')
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    attempts = np.asarray(results[0]['graphs']['attempts'])
+    columns = [attempts]
+    headers = ['Attempt']
+    count = len(attempts)
+    for result in results:
+        graph = result['graphs']
+        if not np.array_equal(graph['attempts'], attempts):
+            raise ValueError('All policies in a comparison must have the same attempt limits.')
+        tag = result['tag']
+        for name, values in [
+            ('Threshold', graph['thresholds']),
+            ('P_success', graph['joint_success']),
+            ('P_user_success', graph['user_success']),
+            ('P_attacker_success', graph['attacker_success']),
+            ('AchievedMean', np.full(count, result['achieved_mean'])),
+            ('FinalP_success', np.full(count, graph['joint_success'][-1])),
+        ]:
+            headers.append(f'{name}_{tag}')
+            columns.append(values)
+    data_path = output_dir / f'livdet_{family}_comparison.txt'
+    np.savetxt(data_path, np.column_stack(columns), fmt='%.17g',
+               comments='', header=' '.join(headers))
+    styles = [('blue', 'o', 'tab:blue'), ('red', 'square*', 'tab:red'),
+              ('teal!70!black', 'triangle*', 'teal')]
+    # One complete figure with vertically stacked subfigures per objective.
+    tex = [
+        r'% Preamble: \usepackage{pgfplots} and \usepackage{subcaption}',
+        r'%           \pgfplotsset{compat=1.18}',
+        r'% Override \ConstraintPolicyDataDir when using a custom output folder.',
+        r'\providecommand{\ConstraintPolicyDataDir}{figs/fig_spoofed_users}',
+        r'\begin{figure}[t]', r'\centering',
+    ]
+    for column, ylabel, caption in [
+        ('Threshold', 'Threshold', 'Optimized threshold at each attempt.'),
+        ('Players', 'Cumulative success probability',
+         'Cumulative user and attacker acceptance probabilities.'),
+    ]:
+        tex.extend([
+            r'\begin{subfigure}{\columnwidth}', r'\centering',
+            r'\begin{tikzpicture}',
+            r'\begin{axis}[width=0.95\linewidth,height=0.55\linewidth,',
+            rf'xlabel={{Attempt}},ylabel={{{ylabel}}},',
+            rf'xmin=0.5,xmax={count+0.5:g},xtick={{1,...,{count}}},grid=major,',
+            rf'legend style={{at={{(0.5,-0.28)}},anchor=north,legend columns={2 if column == "Players" else 3},',
+            r'font=\scriptsize,draw=black,fill=white},legend cell align=left,',
+            r'ymin=0,ymax=1]' if column == 'Players' else r'ymin=0,ymax=100]',
+        ])
+        for index, result in enumerate(results):
+            color, marker, _ = styles[index % len(styles)]
+            value = result['constraint_value']
+            label = (rf"$P'={value:g}$"
+                     if family == 'success_constraints'
+                     else rf"$\mu'={value:g}$")
+            curves = (
+                [('P_user_success', 'solid', 'o', f'User, {label}'),
+                 ('P_attacker_success', 'dashed', 'square*', f'Attacker, {label}')]
+                if column == 'Players' else
+                [('Threshold', 'solid', marker, label)]
+            )
+            for data_column, line_style, point_marker, curve_label in curves:
+                tex.extend([
+                    rf'\addplot[{color},thick,{line_style},mark={point_marker},mark size=1.8pt]',
+                    rf'table[x=Attempt,y={data_column}_{result["tag"]}]',
+                    rf'{{\ConstraintPolicyDataDir/{data_path.name}}};',
+                    rf'\addlegendentry{{{curve_label}}}',
+                ])
+        tex.extend([
+            r'\end{axis}', r'\end{tikzpicture}',
+            rf'\caption{{{caption}}}', r'\end{subfigure}', r'\par\medskip',
+        ])
+    objective = (
+        r"Policies minimizing conditional mean user attempts under three joint-success lower bounds $P'$."
+        if family == 'success_constraints' else
+        r"Policies maximizing joint success under three conditional mean user-attempt upper bounds $\mu'$."
+    )
+    ku, ka = results[0]['k_user'], results[0]['k_attacker']
+    tex.extend([
+        rf'\caption{{{objective} Here $k_u={ku}$ and $k_a={ka}$.',
+        r'Upper panels show thresholds; lower panels show user and attacker acceptance.',
+        r'Colors identify constraints; solid circles denote the user and dashed squares the attacker.',
+        r'Each curve uses one optimized full-horizon threshold sequence.',
+        r'The constraint applies to the complete policy, not to every prefix.}',
+        rf'\label{{fig:livdet_{family}_comparison}}', r'\end{figure}',
+    ])
+    tex_path = output_dir / f'livdet_{family}_comparison.tex'
+    tex_path.write_text('\n'.join(tex) + '\n')
+    for path in (data_path, tex_path):
+        print(f'[comparison] saved {path}', flush=True)
+    return {'data_file': data_path, 'tikz_file': tex_path}
+
+
+def run_constraint_policy_comparisons(
+    thresholds, fars, frrs, eer_threshold, *, family, user_attempts,
+    attacker_attempts, optimizer_starts=64, output_dir=None,
+    saturation_gain_tolerance=0.01,
+):
+    """Run the requested three constraints without overwriting policy exports."""
+    if family == 'success_constraints':
+        values = (0.75, 0.7, 0.6)
+        prefix = 'success_min'
+    elif family == 'mean_limits':
+        values = (1.5, 1.9, 2.4)
+        prefix = 'mean_limit'
+    else:
+        raise ValueError('Unknown constraint comparison family.')
+    output_dir = Path(SPOOF_OUTPUT_DIR if output_dir is None else output_dir)
+    results = []
+    for value in values:
+        tag = f'{value:g}'.replace('.', '_')
+        case_dir = output_dir / f'{prefix}_{tag}'
+        print(f'\n[comparison] {prefix}={value:g}', flush=True)
+        try:
+            if family == 'success_constraints':
+                result = run_minimum_mean_user_attempt_policy(
+                    thresholds, fars, frrs, user_attempts=user_attempts,
+                    attacker_attempts=attacker_attempts,
+                    minimum_success_probability=value, eer_threshold=eer_threshold,
+                    optimizer_starts=optimizer_starts, plot_output_dir=case_dir,
+                    saturation_gain_tolerance=saturation_gain_tolerance,
+                )
+                mean = result['conditional_mean_user_attempts']
+            else:
+                result = run_maximum_success_mean_attempt_policy(
+                    thresholds, fars, frrs, user_attempts=user_attempts,
+                    attacker_attempts=attacker_attempts, maximum_mean_attempts=value,
+                    optimizer_starts=optimizer_starts, plot_output_dir=case_dir,
+                    saturation_gain_tolerance=saturation_gain_tolerance,
+                )
+                mean = result['conditional_mean_attempts']
+        except ValueError as exc:
+            raise ValueError(f'{prefix}={value:g}: {exc}') from exc
+        graphs = result['graphs']
+        final_success = float(graphs['joint_success'][-1])
+        if not np.isfinite(mean):
+            raise RuntimeError(f'{prefix}={value:g}: undefined conditional mean.')
+        if family == 'success_constraints' and final_success < value - 1e-8:
+            raise RuntimeError(f'{prefix}={value:g}: success constraint not met.')
+        if family == 'mean_limits' and mean > value + 1e-8:
+            raise RuntimeError(f'{prefix}={value:g}: mean constraint not met.')
+        results.append({
+            'constraint_value': value, 'tag': tag, 'achieved_mean': mean,
+            'k_user': user_attempts, 'k_attacker': attacker_attempts,
+            'graphs': graphs,
+        })
+    files = export_constraint_comparison(results, family, output_dir=output_dir)
+    return {'policies': results, **files}
+
+
+def summarize_unconstrained_convergence(attempt_counts, scores, tolerance=0.001,
+                                        minimum_followup=10):
+    """Assess the best found up-to-k envelope over the entire tested range.
+
+    Small consecutive increments alone do not establish convergence. A
+    candidate needs at least minimum_followup larger tested horizons, and
+    the best score anywhere later must improve by no more than tolerance.
+    This reports an observed finite-range plateau, never an infinite limit.
+    """
+    ks = np.asarray(attempt_counts)
+    scores = np.asarray(scores, dtype=float)
+    if (ks.ndim != 1 or scores.shape != ks.shape or len(ks) == 0
+            or not np.all(ks == ks.astype(int)) or np.any(ks < 1)
+            or np.any(np.diff(ks) != 1)):
+        raise ValueError('Supply consecutive positive attempt counts and matching scores.')
+    if (not np.all(np.isfinite(scores)) or np.any((scores < 0) | (scores > 1))
+            or not np.isfinite(tolerance) or not 0 <= tolerance <= 1
+            or not isinstance(minimum_followup, (int, np.integer))
+            or minimum_followup < 1):
+        raise ValueError('Invalid success scores, convergence tolerance or follow-up count.')
+    envelope = np.maximum.accumulate(scores)
+    best_index = int(np.argmax(scores))
+    plateau_index = None
+    for index in range(max(0, len(ks) - minimum_followup)):
+        if float(envelope[-1] - envelope[index]) <= tolerance + 1e-12:
+            plateau_index = index
+            break
+    return {
+        'best_success': float(scores[best_index]), 'best_k': int(ks[best_index]),
+        'tested_k_max': int(ks[-1]), 'tolerance': float(tolerance),
+        'minimum_followup': int(minimum_followup), 'envelope': envelope,
+        'plateau_k': int(ks[plateau_index]) if plateau_index is not None else None,
+        'success_at_plateau': float(envelope[plateau_index]) if plateau_index is not None else None,
+        'remaining_observed_gain': float(envelope[-1] - envelope[plateau_index])
+                                   if plateau_index is not None else None,
+    }
+
+
+def run_unconstrained_convergence_search(
+    thresholds, fars, frrs, eer_threshold, *, max_attempts=100,
+    gain_tolerance=0.001, minimum_followup=10, optimizer_starts=64,
+    global_iterations=100, population_multiplier=10, output_dir=None,
+    restart=False,
+):
+    """Search k_u=k_a=k with no success or conditional-mean constraint.
+
+    All k thresholds are optimized jointly for every k. Equal thresholds
+    are only a retained baseline, never imposed as a restriction. Cached
+    points can be reused when extending max_attempts or changing the cutoff.
+    """
+    if (not isinstance(max_attempts, (int, np.integer)) or max_attempts < 1
+            or not isinstance(minimum_followup, (int, np.integer))
+            or minimum_followup < 1 or max_attempts <= minimum_followup
+            or min(optimizer_starts, global_iterations, population_multiplier) < 1):
+        raise ValueError('Use positive search settings and max_attempts > minimum_followup.')
+    if not np.isfinite(gain_tolerance) or not 0 <= gain_tolerance <= 1:
+        raise ValueError('Convergence tolerance must be finite and in [0,1].')
+    thresholds, fars, frrs = [np.asarray(v, dtype=float) for v in (thresholds, fars, frrs)]
+    if (thresholds.ndim != 1 or thresholds.size < 2 or fars.shape != thresholds.shape
+            or frrs.shape != thresholds.shape or np.any(np.diff(thresholds) <= 0)
+            or not all(np.all(np.isfinite(v)) for v in (thresholds, fars, frrs))
+            or np.any((fars < 0) | (fars > 1)) or np.any((frrs < 0) | (frrs > 1))):
+        raise ValueError('Invalid threshold grid or FAR/FRR arrays.')
+    output_dir = Path(SPOOF_OUTPUT_DIR if output_dir is None else output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint = output_dir / 'livdet_unconstrained_convergence_checkpoint.json'
+    settings = {'schema': 1, 'optimizer_starts': int(optimizer_starts),
+                'global_iterations': int(global_iterations),
+                'population_multiplier': int(population_multiplier),
+                'eer_threshold': float(eer_threshold)}
+    digest = hashlib.sha256(json.dumps(settings, sort_keys=True).encode())
+    for values in (thresholds, fars, frrs):
+        digest.update(np.asarray(values, dtype='<f8').tobytes())
+    signature = digest.hexdigest()
+    cache = {}
+    if checkpoint.exists() and not restart:
+        stored = json.loads(checkpoint.read_text())
+        if stored.get('signature') != signature:
+            raise ValueError('Convergence checkpoint uses different inputs/search settings. '
+                             'Use --convergence-restart or a different --policy-plot-output-dir.')
+        for row in stored.get('records', []):
+            k = int(row['k'])
+            policy = np.asarray(row['thresholds'], dtype=float)
+            if (k < 1 or k in cache or policy.shape != (k,)
+                    or not np.all(np.isfinite(policy))
+                    or np.any((policy < thresholds[0]) | (policy > thresholds[-1]))):
+                raise ValueError('Invalid convergence checkpoint policy.')
+            score = attempt_biometric_success(policy, thresholds, fars, frrs)
+            if not np.isclose(score, row['P_success'], rtol=1e-10, atol=1e-12):
+                raise ValueError('Convergence checkpoint score does not match its policy.')
+            cache[k] = row
+    records = []
+    neutral_indices = np.flatnonzero((fars == 0.0) & (frrs == 1.0))
+    # An exactly reject-all grid point can extend the old policy without
+    # changing its score. Never synthesize such a point from estimated tails.
+    neutral_threshold = float(thresholds[neutral_indices[-1]]) if neutral_indices.size else None
+    print('[convergence] Unconstrained search: k_user=k_attacker=k; '
+          'separate optimized threshold vector for every k.', flush=True)
+    print('[convergence] Results are numerical lower bounds on achievable maxima; '
+          'a finite plateau is not a proof of an infinite-attempt limit.', flush=True)
+    for k in range(1, max_attempts + 1):
+        if k in cache:
+            row = cache[k]
+            source = 'cached'
+        else:
+            candidates = []
+            if records:
+                previous = np.asarray(records[-1]['thresholds'])
+                candidates.append(np.r_[previous, previous[-1]])
+                if neutral_threshold is not None:
+                    candidates.insert(0, np.r_[previous, neutral_threshold])
+            policy, score, diagnostics = optimize_attempt_thresholds(
+                thresholds, fars, frrs, k, eer_threshold=eer_threshold,
+                n_starts=optimizer_starts, de_maxiter=global_iterations,
+                de_popsize=population_multiplier, initial_candidates=candidates,
+            )
+            policy = np.asarray(policy, dtype=float)
+            score = attempt_biometric_success(policy, thresholds, fars, frrs)
+            pu, reject_a = user_attacker_policy_probabilities(
+                policy, thresholds, fars, frrs, k, k,
+            )
+            row = {'k': k, 'thresholds': policy.tolist(), 'P_success': float(score),
+                   'P_user_success': pu, 'P_attacker_success': 1.0 - reject_a,
+                   'diagnostics': diagnostics}
+            cache[k] = row
+            temporary = checkpoint.with_suffix('.tmp')
+            temporary.write_text(json.dumps({'signature': signature, 'settings': settings,
+                                            'records': [cache[j] for j in sorted(cache)]},
+                                           indent=2, allow_nan=False))
+            temporary.replace(checkpoint)
+            source = 'optimized'
+        previous_best = max((r['P_success'] for r in records), default=0.0)
+        records.append(row)
+        best = max(previous_best, row['P_success'])
+        print(f'[convergence] k={k}: P_success={row["P_success"]:.10f}; '
+              f'best through k={best:.10f}; additional best gain={best-previous_best:.10g} '
+              f'({source})', flush=True)
+    return export_unconstrained_convergence_results(
+        records, output_dir=output_dir, gain_tolerance=gain_tolerance,
+        minimum_followup=minimum_followup, thresholds=thresholds, fars=fars, frrs=frrs,
+    )
+
+
+def export_unconstrained_convergence_results(
+    records, *, output_dir, gain_tolerance=0.001, minimum_followup=10,
+    thresholds=None, fars=None, frrs=None,
+):
+    """Regenerate convergence data and TikZ without running any optimizer."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint = output_dir / 'livdet_unconstrained_convergence_checkpoint.json'
+    max_attempts = int(records[-1]['k'])
+    ks = np.array([r['k'] for r in records])
+    scores = np.array([r['P_success'] for r in records])
+    summary = summarize_unconstrained_convergence(ks, scores, gain_tolerance, minimum_followup)
+    envelope = summary.pop('envelope')
+    best_budget_k = []
+    best_index = 0
+    for index, score in enumerate(scores):
+        if score > scores[best_index]:
+            best_index = index
+        best_budget_k.append(int(ks[best_index]))
+    table = np.column_stack((
+        ks, scores, envelope, best_budget_k,
+        np.r_[np.nan, np.diff(scores)], np.r_[np.nan, np.diff(envelope)],
+        [r['P_user_success'] for r in records],
+        [r['P_attacker_success'] for r in records],
+    ))
+    txt = output_dir / 'livdet_unconstrained_success_convergence.txt'
+    np.savetxt(txt, table, fmt='%.17g', comments='',
+               header=('k P_success_optimized P_success_best Best_policy_k '
+                       'Gain_vs_previous Best_gain_vs_previous P_user_success P_attacker_success'))
+    best_row = records[int(np.argmax(scores))]
+    summary['best_thresholds'] = best_row['thresholds']
+    summary['scope'] = 'Numerical search over tested k only; no certified infinite limit.'
+    zero_far = (np.flatnonzero((fars == 0.0) & (frrs < 1.0))
+                if thresholds is not None and fars is not None and frrs is not None
+                else np.array([], dtype=int))
+    if zero_far.size:
+        # Repeating this threshold has success 1-FRR(t)^k -> 1 under the
+        # loaded independent-attempt model. An estimated FAR of zero is
+        # not a claim that the real-world false-accept probability is zero.
+        zero_index = int(zero_far[np.argmin(frrs[zero_far])])
+        summary['loaded_model_infinite_attempt_limit'] = 1.0
+        summary['zero_far_threshold'] = float(thresholds[zero_index])
+        summary['zero_far_threshold_frr'] = float(frrs[zero_index])
+        print(f'[model] The loaded FAR/FRR model contains FAR=0 and FRR<1 at '
+              f't={thresholds[zero_index]:.10g}. Repeating that threshold lets '
+              'success approach 1 as k grows under this model. A lower observed '
+              'plateau is not its infinite-attempt limit. Estimated zero FAR '
+              'does not establish real-world zero FAR.', flush=True)
+    else:
+        summary['loaded_model_infinite_attempt_limit'] = None
+
+    summary_path = output_dir / 'livdet_unconstrained_convergence_summary.json'
+    summary_path.write_text(json.dumps(summary, indent=2, allow_nan=False))
+    tex = [
+        r'% Preamble: \usepackage{pgfplots}; \pgfplotsset{compat=1.18}',
+        r'\providecommand{\ConvergenceDataDir}{figs/fig_spoofed_users}',
+        r'\begin{figure}[t]', r'\centering', r'\begin{tikzpicture}',
+        r'\begin{axis}[width=0.95\linewidth,height=0.6\linewidth,',
+        r'xlabel={Number of attempts, $k$},ylabel={Overall success probability},',
+        rf'xmin=1,xmax={max_attempts},ymin=0,ymax=1.02,grid=major,',
+        r'legend pos=south east]',
+        r'\addplot[blue,thick,mark=*,mark size=1.3pt,mark repeat=10]',
+        r'table[x=k,y=P_success_optimized]',
+        r'{\ConvergenceDataDir/livdet_unconstrained_success_convergence.txt};',
+        r'\addlegendentry{Optimized overall success}',
+        rf'\addplot[black,dashed,thick] coordinates {{(1,1) ({max_attempts},1)}};',
+        r'\addlegendentry{$P_{\mathrm{success}}=1$}',
+        r'\end{axis}', r'\end{tikzpicture}',
+        rf'\caption{{Optimized overall success probability for $k_u=k_a=k$,',
+        rf'with $k=1,\ldots,{max_attempts}$. Thresholds are optimized separately',
+        r'for each $k$ without conditional mean or success-probability constraints.',
+        r'The dashed line marks probability one; a finite simulation alone',
+        r'does not establish an infinite-attempt limit.}',
+        r'\label{fig:unconstrained_success_convergence}', r'\end{figure}',
+    ]
+    tex_path = output_dir / 'livdet_unconstrained_success_convergence.tex'
+    tex_path.write_text('\n'.join(tex) + '\n')
+    print(f'\n[convergence] Highest overall success found: {summary["best_success"]:.10f} '
+          f'at k={summary["best_k"]}.', flush=True)
+    if summary['plateau_k'] is None:
+        print(f'[convergence] No plateau confirmed through k={max_attempts} with '
+              f'{minimum_followup} later tested horizons and tolerance {gain_tolerance:g}.',
+              flush=True)
+    else:
+        print(f'[convergence] Negligible further best-found gain from k={summary["plateau_k"]}: '
+              f'{summary["remaining_observed_gain"]:.10g} <= {gain_tolerance:g} '
+              f'over all later tested k through {max_attempts}.', flush=True)
+        print(f'[convergence] Best success available by that k: '
+              f'{summary["success_at_plateau"]:.10f}.', flush=True)
+    print('[convergence] Extend --convergence-max-k to check the apparent plateau; '
+          'completed k values are reused from the checkpoint.', flush=True)
+    for file in (txt, summary_path, checkpoint, tex_path):
+        print(f'[convergence] saved {file}', flush=True)
+    return {'summary': summary, 'records': records, 'data_file': txt,
+            'checkpoint': checkpoint, 'tikz_file': tex_path}
+
+
+def plot_saved_unconstrained_convergence(
+    *, output_dir=None, max_attempts=200, gain_tolerance=0.001,
+    minimum_followup=10,
+):
+    """Export TXT/TikZ from saved k=1..max_attempts; never run optimization."""
+    if max_attempts <= minimum_followup or minimum_followup < 1:
+        raise ValueError('Require max_attempts > positive minimum_followup.')
+    if not np.isfinite(gain_tolerance) or not 0 <= gain_tolerance <= 1:
+        raise ValueError('Convergence tolerance must be finite and in [0,1].')
+    output_dir = Path(SPOOF_OUTPUT_DIR if output_dir is None else output_dir)
+    checkpoint = output_dir / 'livdet_unconstrained_convergence_checkpoint.json'
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f'Saved convergence checkpoint not found: {checkpoint}. '
+                                'Use --policy-plot-output-dir for its containing folder.')
+    saved = json.loads(checkpoint.read_text())
+    records_by_k = {}
+    for row in saved.get('records', []):
+        k = int(row['k'])
+        if k in records_by_k:
+            raise ValueError(f'Duplicate checkpoint row for k={k}.')
+        if k < 1 or k > max_attempts:
+            continue
+        values = np.asarray([row['P_success'],row['P_user_success'],
+                             row['P_attacker_success']], dtype=float)
+        policy = np.asarray(row['thresholds'], dtype=float)
+        if (not np.all(np.isfinite(values)) or np.any((values < 0) | (values > 1))
+                or policy.shape != (k,) or not np.all(np.isfinite(policy))
+                or not np.isclose(values[0],values[1]*(1-values[2]),rtol=1e-9,atol=1e-12)):
+            raise ValueError(f'Invalid saved result at k={k}.')
+        records_by_k[k] = row
+    missing = [k for k in range(1,max_attempts+1) if k not in records_by_k]
+    if missing:
+        raise ValueError(f'Checkpoint is missing {len(missing)} required k values; '
+                         f'first missing k={missing[0]}. Plot-only mode will not '
+                         'simulate missing values. Resume the original convergence search first.')
+    print(f'[plot-only] Reusing all {max_attempts} saved results; no optimization.',flush=True)
+    return export_unconstrained_convergence_results(
+        [records_by_k[k] for k in range(1,max_attempts+1)], output_dir=output_dir,
+        gain_tolerance=gain_tolerance, minimum_followup=minimum_followup,
+    )
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run the full LivDet analysis or reuse saved biometric inputs "
+            "for the P_safe sweep or parametric attempt comparison."
+        )
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--sweep-only",
+        action="store_true",
+        help="Load psafe_sweep_inputs.npz and run only the P_safe sweep.",
+    )
+    mode.add_argument(
+        "--attempts-only",
+        action="store_true",
+        help=(
+            "Load psafe_sweep_inputs.npz and run only the k-attempt "
+            "biometric threshold comparison."
+        ),
+    )
+    mode.add_argument(
+        "--sequential-attempts-only",
+        "--remaining-attempts-only",
+        dest="sequential_attempts_only",
+        action="store_true",
+        help=(
+            "Load psafe_sweep_inputs.npz and greedily optimize each new "
+            "attempt threshold while keeping earlier thresholds fixed."
+        ),
+    )
+    mode.add_argument(
+        "--fixed-prefix-attempts-only",
+        action="store_true",
+        help=(
+            "Load psafe_sweep_inputs.npz and re-optimize all unused "
+            "thresholds while keeping thresholds from prior attempts fixed."
+        ),
+    )
+    mode.add_argument(
+        "--fixed-user-attacker-policy-only",
+        action="store_true",
+        help=(
+            "Load psafe_sweep_inputs.npz and optimize per-attempt thresholds "
+            "for one "
+            "predetermined (k_u, k_a) policy."
+        ),
+    )
+    mode.add_argument(
+        "--minimize-user-attempts-only",
+        action="store_true",
+        help=(
+            "Load psafe_sweep_inputs.npz and minimize the legitimate "
+            "user's conditional mean authentication-attempt number, using "
+            "distinct per-attempt thresholds. The constraint can be either "
+            "P_success >= P' or separate lower bounds on user success and "
+            "attacker rejection."
+        ),
+    )
+    mode.add_argument(
+        "--maximize-success-with-mean-attempts",
+        "--maximize-success-with-mean-attempt",
+        type=float, default=None, metavar="MEAN_LIMIT",
+        help=("Reuse psafe_sweep_inputs.npz and maximize joint P_success subject "
+              "to E[J | user succeeds] <= MEAN_LIMIT (finite and at least 1). "
+              "Uses --k-user, --k-attacker and --optimizer-starts."),
+    )
+    mode.add_argument(
+        "--compare-success-constraints-only", action="store_true",
+        help="Compare minimum-mean policies with P_success >= 0.75, 0.7 and 0.6.",
+    )
+    mode.add_argument(
+        "--compare-mean-limits-only", action="store_true",
+        help="Compare maximum-success policies with mean limits 1.5, 1.9 and 2.4.",
+    )
+    mode.add_argument(
+        "--compare-policy-constraints-only", action="store_true",
+        help="Run both three-constraint comparisons and export two stacked-subfigure figures.",
+    )
+    mode.add_argument(
+        "--unconstrained-convergence-only", action="store_true",
+        help="Search maximum overall success over k_user=k_attacker=1..K, without mean/success constraints.",
+    )
+    mode.add_argument(
+        "--plot-unconstrained-convergence-only", action="store_true",
+        help="Export saved convergence TXT and TikZ only, without re-running optimization.",
+    )
+    parser.add_argument("--convergence-max-k", type=int, default=100)
+    parser.add_argument("--convergence-tolerance", type=float, default=0.001,
+                        help="Absolute gain cutoff: 0.001 means 0.1 percentage points.")
+    parser.add_argument("--convergence-min-followup", type=int, default=10,
+                        help="Require this many larger k values after a candidate plateau.")
+    parser.add_argument("--convergence-global-iterations", type=int, default=100)
+    parser.add_argument("--convergence-popsize", type=int, default=10)
+    parser.add_argument("--convergence-restart", action="store_true",
+                        help="Recompute the convergence checkpoint instead of resuming it.")
+    parser.add_argument(
+        "--saturation-gain-tolerance", type=float, default=0.01, metavar="EPSILON",
+        help=("Report the earliest attempt after which overall mechanism success "
+              "changes by <= EPSILON at every later attempt. Absolute probability units: "
+              "0.01 means one percentage point (default). Diagnostic only."),
+    )
+    parser.add_argument(
+        "--policy-plot-output-dir", type=Path, default=SPOOF_OUTPUT_DIR,
+        help="Directory for per-attempt TXT tables and TikZ figures.",
+    )
+    parser.add_argument(
+        "--attempts",
+        type=int,
+        nargs="+",
+        default=[2, 4, 6],
+        metavar="K",
+        help=(
+            "Attempt counts to analyze with --attempts-only or "
+            "a sequential fixed-threshold checkpoint-only mode "
+            "(default: 2 4 6)."
+        ),
+    )
+    parser.add_argument(
+        "--optimizer-starts",
+        type=int,
+        default=64,
+        help=(
+            "Number of local-optimizer initializations for each k or "
+            "asymmetric attempt pair (default: 64)."
+        ),
+    )
+    parser.add_argument(
+        "--attempts-output",
+        type=Path,
+        default=ATTEMPTS_SUCCESS_DATA,
+        help="Output path for the TikZ-ready equal-threshold success curves.",
+    )
+    parser.add_argument(
+        "--fixed-prefix-tikz-output",
+        type=Path,
+        nargs="?",
+        const=FIXED_PREFIX_TIKZ_DATA,
+        default=None,
+        metavar="FILE",
+        help=(
+            "With --fixed-prefix-attempts-only, export the final-attempt "
+            "FAR, FRR, Threshold, the complete Threshold_j sequence, P_success_max, "
+            "cumulative FRR product, and cumulative "
+            "(1-FAR) product, plus the EER and one-attempt-optimum baselines "
+            "for every requested k. If FILE is omitted, write to the default "
+            "spoof-output directory."
+        ),
+    )
+    parser.add_argument(
+        "--k-user",
+        type=int,
+        default=4,
+        help="User attempt limit for the fixed asymmetric policy (default: 4).",
+    )
+    parser.add_argument(
+        "--k-attacker",
+        type=int,
+        default=10,
+        help=(
+            "Attacker attempt limit for the fixed asymmetric policy "
+            "(default: 10)."
+        ),
+    )
+    parser.add_argument(
+        "--minimum-success-probability",
+        "--p-success-min",
+        dest="minimum_success_probability",
+        type=float,
+        default=0.85,
+        metavar="P_PRIME",
+        help=(
+            "Required lower bound P' for P_success in "
+            "--minimize-user-attempts-only mode (default: 0.85)."
+        ),
+    )
+    parser.add_argument(
+        "--minimum-user-success-probability",
+        "--p-user-success-min",
+        dest="minimum_user_success_probability",
+        type=float,
+        default=None,
+        metavar="P_USER_MIN",
+        help=(
+            "Alternative separate lower bound for the legitimate user's "
+            "success probability. Must be used together with "
+            "--minimum-attacker-rejection-probability. When supplied, the "
+            "separate constraints replace --minimum-success-probability."
+        ),
+    )
+    parser.add_argument(
+        "--minimum-attacker-rejection-probability",
+        "--p-attacker-rejection-min",
+        dest="minimum_attacker_rejection_probability",
+        type=float,
+        default=None,
+        metavar="P_ATTACKER_REJECTION_MIN",
+        help=(
+            "Alternative separate lower bound for the probability that all "
+            "attacker attempts are rejected. Must be used together with "
+            "--minimum-user-success-probability."
+        ),
+    )
+    parser.add_argument(
+        "--fixed-user-attacker-tikz-output",
+        type=Path,
+        default=FIXED_USER_ATTACKER_TIKZ_DATA,
+        help="Output path for the fixed-policy TikZ success curves.",
+    )
+    parser.add_argument("--safe-start", type=float, default=0.60)
+    parser.add_argument("--safe-end", type=float, default=0.90)
+    parser.add_argument("--safe-step", type=float, default=0.01)
+    args = parser.parse_args()
+    if (not np.isfinite(args.saturation_gain_tolerance)
+            or not 0 <= args.saturation_gain_tolerance <= 1):
+        parser.error("--saturation-gain-tolerance must be finite and in [0, 1].")
+    if (
+        args.fixed_prefix_tikz_output is not None
+        and not args.fixed_prefix_attempts_only
+    ):
+        parser.error(
+            "--fixed-prefix-tikz-output requires "
+            "--fixed-prefix-attempts-only."
+        )
+    separate_constraints = (
+        args.minimum_user_success_probability is not None,
+        args.minimum_attacker_rejection_probability is not None,
+    )
+    if any(separate_constraints) and not all(separate_constraints):
+        parser.error(
+            "--minimum-user-success-probability and "
+            "--minimum-attacker-rejection-probability must be supplied "
+            "together."
+        )
+    if any(separate_constraints) and not args.minimize_user_attempts_only:
+        parser.error(
+            "The separate probability constraints require "
+            "--minimize-user-attempts-only."
+        )
+    if args.maximize_success_with_mean_attempts is not None:
+        if (not np.isfinite(args.maximize_success_with_mean_attempts)
+                or args.maximize_success_with_mean_attempts < 1):
+            parser.error("--maximize-success-with-mean-attempts must be finite and at least 1.")
+        if min(args.k_user, args.k_attacker, args.optimizer_starts) < 1:
+            parser.error("--k-user, --k-attacker and --optimizer-starts must be positive.")
+    if args.minimize_user_attempts_only:
+        if min(args.k_user, args.k_attacker, args.optimizer_starts) < 1:
+            parser.error("--k-user, --k-attacker and --optimizer-starts must be positive.")
+    if (args.compare_success_constraints_only or args.compare_mean_limits_only
+            or args.compare_policy_constraints_only):
+        if min(args.k_user, args.k_attacker, args.optimizer_starts) < 1:
+            parser.error("--k-user, --k-attacker and --optimizer-starts must be positive.")
+    if args.unconstrained_convergence_only or args.plot_unconstrained_convergence_only:
+        if (args.convergence_min_followup < 1
+                or args.convergence_max_k <= args.convergence_min_followup
+                or min(args.optimizer_starts, args.convergence_global_iterations,
+                       args.convergence_popsize) < 1):
+            parser.error("Require max k > positive min-followup and positive optimizer settings.")
+        if not np.isfinite(args.convergence_tolerance) or not 0 <= args.convergence_tolerance <= 1:
+            parser.error("--convergence-tolerance must be finite and in [0,1].")
+    return args
+
+# =========================
+# Main
+# =========================
+if __name__ == "__main__":
+    args = parse_arguments()
+
+    if args.plot_unconstrained_convergence_only:
+        if args.convergence_restart:
+            raise ValueError('--convergence-restart cannot be used in plot-only mode.')
+        plot_saved_unconstrained_convergence(
+            output_dir=args.policy_plot_output_dir,
+            max_attempts=args.convergence_max_k,
+            gain_tolerance=args.convergence_tolerance,
+            minimum_followup=args.convergence_min_followup,
+        )
+        raise SystemExit(0)
+
+    if args.unconstrained_convergence_only:
+        thresholds, fars, frrs, eer_threshold = load_sweep_inputs(SWEEP_INPUTS_FILE)
+        run_unconstrained_convergence_search(
+            thresholds, fars, frrs, eer_threshold,
+            max_attempts=args.convergence_max_k,
+            gain_tolerance=args.convergence_tolerance,
+            minimum_followup=args.convergence_min_followup,
+            optimizer_starts=args.optimizer_starts,
+            global_iterations=args.convergence_global_iterations,
+            population_multiplier=args.convergence_popsize,
+            output_dir=args.policy_plot_output_dir,
+            restart=args.convergence_restart,
+        )
+        raise SystemExit(0)
+
+    if (args.compare_success_constraints_only or args.compare_mean_limits_only
+            or args.compare_policy_constraints_only):
+        thresholds, fars, frrs, eer_threshold = load_sweep_inputs(SWEEP_INPUTS_FILE)
+        families = []
+        if args.compare_success_constraints_only or args.compare_policy_constraints_only:
+            families.append("success_constraints")
+        if args.compare_mean_limits_only or args.compare_policy_constraints_only:
+            families.append("mean_limits")
+        for family in families:
+            run_constraint_policy_comparisons(
+                thresholds, fars, frrs, eer_threshold, family=family,
+                user_attempts=args.k_user, attacker_attempts=args.k_attacker,
+                optimizer_starts=args.optimizer_starts,
+                output_dir=args.policy_plot_output_dir,
+                saturation_gain_tolerance=args.saturation_gain_tolerance,
+            )
+        raise SystemExit(0)
+
+    if args.sweep_only:
+        thresholds, fars, frrs, eer_threshold = load_sweep_inputs(
+            SWEEP_INPUTS_FILE
+        )
+        run_psafe_sweep_from_inputs(
+            thresholds,
+            fars,
+            frrs,
+            eer_threshold,
+            safe_start=args.safe_start,
+            safe_end=args.safe_end,
+            safe_step=args.safe_step,
+        )
+        raise SystemExit(0)
+
+    if args.attempts_only:
+        thresholds, fars, frrs, eer_threshold = load_sweep_inputs(
+            SWEEP_INPUTS_FILE
+        )
+        run_attempt_comparisons(
+            thresholds,
+            fars,
+            frrs,
+            eer_threshold,
+            attempt_counts=args.attempts,
+            optimizer_starts=args.optimizer_starts,
+            success_data_file=args.attempts_output,
+        )
+        raise SystemExit(0)
+
+    if args.sequential_attempts_only:
+        thresholds, fars, frrs, _ = load_sweep_inputs(
+            SWEEP_INPUTS_FILE
+        )
+        run_sequential_attempt_comparisons(
+            thresholds,
+            fars,
+            frrs,
+            attempt_counts=args.attempts,
+        )
+        raise SystemExit(0)
+
+    if args.fixed_prefix_attempts_only:
+        thresholds, fars, frrs, eer_threshold = load_sweep_inputs(
+            SWEEP_INPUTS_FILE
+        )
+        run_fixed_prefix_attempt_comparisons(
+            thresholds,
+            fars,
+            frrs,
+            eer_threshold,
+            attempt_counts=args.attempts,
+            optimizer_starts=args.optimizer_starts,
+            tikz_data_file=args.fixed_prefix_tikz_output,
+        )
+        raise SystemExit(0)
+
+    if args.fixed_user_attacker_policy_only:
+        thresholds, fars, frrs, eer_threshold = load_sweep_inputs(
+            SWEEP_INPUTS_FILE
+        )
+        run_fixed_user_attacker_policy(
+            thresholds,
+            fars,
+            frrs,
+            user_attempts=args.k_user,
+            attacker_attempts=args.k_attacker,
+            eer_threshold=eer_threshold,
+            optimizer_starts=args.optimizer_starts,
+            tikz_data_file=args.fixed_user_attacker_tikz_output,
+        )
+        raise SystemExit(0)
+
+    if args.minimize_user_attempts_only:
+        thresholds, fars, frrs, eer_threshold = load_sweep_inputs(
+            SWEEP_INPUTS_FILE
+        )
+        run_minimum_mean_user_attempt_policy(
+            thresholds,
+            fars,
+            frrs,
+            user_attempts=args.k_user,
+            attacker_attempts=args.k_attacker,
+            minimum_success_probability=(
+                args.minimum_success_probability
+            ),
+            eer_threshold=eer_threshold,
+            minimum_user_success_probability=(
+                args.minimum_user_success_probability
+            ),
+            minimum_attacker_rejection_probability=(
+                args.minimum_attacker_rejection_probability
+            ),
+            optimizer_starts=args.optimizer_starts,
+            plot_output_dir=args.policy_plot_output_dir,
+            saturation_gain_tolerance=args.saturation_gain_tolerance,
+        )
+        raise SystemExit(0)
+
+    if args.maximize_success_with_mean_attempts is not None:
+        thresholds, fars, frrs, _ = load_sweep_inputs(SWEEP_INPUTS_FILE)
+        run_maximum_success_mean_attempt_policy(
+            thresholds, fars, frrs,
+            user_attempts=args.k_user, attacker_attempts=args.k_attacker,
+            maximum_mean_attempts=args.maximize_success_with_mean_attempts,
+            optimizer_starts=args.optimizer_starts,
+            plot_output_dir=args.policy_plot_output_dir,
+            saturation_gain_tolerance=args.saturation_gain_tolerance,
+        )
+        raise SystemExit(0)
+
+    genuine_raw, impostor_raw, genuine_best, impostor_best = (
+        collect_multiuser_scores()
+    )
+    save_aggregated_scores_csv(genuine_best, impostor_best)
+
+    print(f"[i] Aggregated genuine scores : n={len(genuine_raw)}  min={genuine_raw.min():.4f}  max={genuine_raw.max():.4f}  mean={genuine_raw.mean():.4f}")
+    print(f"[i] Aggregated impostor scores: n={len(impostor_raw)} min={impostor_raw.min():.4f} max={impostor_raw.max():.4f} mean={impostor_raw.mean():.4f}")
+    print(f"[i] Aggregated CSV saved to   : {AGGREGATED_SCORES_CSV}")
+
+    genuine, impostor, raw_max = normalize_scores_to_100(genuine_raw, impostor_raw)
+
+    print(f"[i] Normalization factor (raw max) = {raw_max:.4f}")
+    print(f"[i] Normalized genuine scores : min={genuine.min():.4f}  max={genuine.max():.4f}  mean={genuine.mean():.4f}")
+    print(f"[i] Normalized impostor scores: min={impostor.min():.4f} max={impostor.max():.4f} mean={impostor.mean():.4f}")
+
+    export_histograms(genuine, impostor)
+    export_empirical_cdfs(genuine, impostor)
+
+    thresholds, fars, frrs = compute_far_frr_from_smoothed_pdf(
+        genuine,
+        impostor,
+        step=PDF_FINE_STEP,
+        sigma_points=SMOOTH_SIGMA_POINTS,
+    )
+
+    eer, eer_threshold = compute_eer_intersection(thresholds, fars, frrs)
+
+    print(f"[i] EER = {eer:.6f}")
+    print(f"[i] EER threshold â‰ˆ {eer_threshold:.4f}")
+
+    save_sweep_inputs(
+        SWEEP_INPUTS_FILE,
+        thresholds,
+        fars,
+        frrs,
+        eer_threshold,
+    )
+
+    # The FAR/FRR figure and its TikZ files use the unsmoothed histogram
+    # integrals.  The existing analysis arrays above are retained for the
+    # remaining optimization and sweep calculations.
+    display_thresholds, display_fars, display_frrs = (
+        compute_far_frr_from_histogram(genuine, impostor)
+    )
+    display_eer, display_eer_threshold = compute_discrete_eer(
+        display_thresholds,
+        display_fars,
+        display_frrs,
+    )
+    theoretical_thresholds = np.arange(
+        HIST_BINS[0],
+        HIST_BINS[-1] + 0.5 * THEORETICAL_CURVE_STEP,
+        THEORETICAL_CURVE_STEP,
+    )
+    theoretical = compute_ks_theoretical_far_frr(theoretical_thresholds)
+
+    print(f"[i] Discrete histogram EER = {display_eer:.6f}")
+    print(
+        "[i] Discrete histogram EER threshold = "
+        f"{display_eer_threshold:.4f}"
+    )
+    print(f"[i] KS uniform genuine parameters = {KS_UNIFORM_GENUINE}")
+    print(f"[i] KS uniform impostor parameters = {KS_UNIFORM_IMPOSTOR}")
+    print(f"[i] KS quadratic genuine parameters = {KS_QUADRATIC_GENUINE}")
+    print(f"[i] KS quadratic impostor parameters = {KS_QUADRATIC_IMPOSTOR}")
+    print(f"[i] KS normal genuine parameters = {KS_NORMAL_GENUINE}")
+    print(f"[i] KS normal impostor parameters = {KS_NORMAL_IMPOSTOR}")
+
+    export_far_frr(
+        display_thresholds,
+        display_fars,
+        display_frrs,
+        theoretical_thresholds,
+        theoretical,
+        display_eer,
+        display_eer_threshold,
+    )
+    p_success, max_success, max_threshold = compute_p_success(thresholds, fars, frrs)
+
+    print(f"[i] Max P_success = {max_success:.4f}")
+    print(f"[i] Max P_success threshold = {max_threshold:.4f}")
+
+
+    p_and, p_or, idx_and, idx_or, p_and_eer, p_or_eer = compute_success_and_or(
+        thresholds,
+        fars,
+        frrs,
+        eer_threshold=eer_threshold,
+        P_safe=0.8,
+        P_leak=0.15,
+        P_loss=0.04,
+        P_theft=0.01,
+    )
+    export_p_success(thresholds, p_success, eer_threshold, max_success, max_threshold)
+    print(f"[i] AND max P_success = {p_and[idx_and]:.4f} at T={thresholds[idx_and]:.4f}")
+    print(f"[i] OR  max P_success = {p_or[idx_or]:.4f} at T={thresholds[idx_or]:.4f}")
+    print(f"[i] AND at EER = {p_and_eer:.4f}")
+    print(f"[i] OR  at EER = {p_or_eer:.4f}")
+
+    export_success_and_or(
+        thresholds,
+        p_and,
+        p_or,
+        idx_and,
+        idx_or,
+        eer_threshold,
+        p_and_eer,
+        p_or_eer,
+    )
+    run_psafe_sweep_from_inputs(
+        thresholds,
+        fars,
+        frrs,
+        eer_threshold,
+        safe_start=args.safe_start,
+        safe_end=args.safe_end,
+        safe_step=args.safe_step,
+    )

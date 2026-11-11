@@ -1,0 +1,40 @@
+# — LaTeX intermediate files
+*.aux
+*.log
+*.out
+*.toc
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.bbl
+*.blg
+*.lof
+*.lot
+*.nav
+*.snm
+*.vrb
+*.tex
+*.png
+# — Output files
+*.dvi
+*.ps
+
+# — Backup and swap files
+*~
+*.bak
+*.swp
+*.tmp
+*.pytxcode
+*.png
+# — VS Code workspace settings
+.vscode/
+*.csv
+*venv
+
+# Generated Maven build files can contain machine-specific absolute paths.
+**/target/
+
+# macOS Finder metadata
+.DS_Store
+IEEEtran*
+main.bib
