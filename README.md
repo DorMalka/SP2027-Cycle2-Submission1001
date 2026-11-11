@@ -12,9 +12,9 @@ This repository contains simulation code and numerical results accompanying the 
 
 The empirical experiments use the **LivDet 2015 fingerprint dataset, Digital Persona sensor**, with Training and Testing partitions. The fingerprint images are not distributed in this repository.
 
-The authors obtained authorization to use the data for a four-week period. This describes the authors' particular authorization, not a standard access period promised to reviewers. The dataset release agreement itself does not specify a four-week duration. Reviewers must obtain their own approval and follow the conditions and access period granted by the dataset providers; this artifact does not transfer the authors' authorization.
+The authors obtained authorization to use the data for a four-week period. This describes the authors' particular authorization, not a standard access period promised to reviewers. Reviewers must obtain their own approval and follow the conditions and access period granted by the dataset providers; this artifact does not transfer the authors' authorization.
 
-The LivDet release agreement requires a completed, signed request and case-by-case approval. It prohibits redistribution of all or part of the biometric dataset without prior approval from the Principal Investigator, and requires written approval before publishing captured biometric features. It also specifies dataset citation requirements. Therefore, downloading this repository does not provide access to the original fingerprint images or permission to redistribute them.
+The LivDet release agreement requires a completed, signed request and case-by-case approval. It prohibits redistribution of all or part of the biometric dataset without prior approval from the Principal Investigator, and requires written approval before publishing captured biometric features. Therefore, downloading this repository does not provide access to the original fingerprint images or permission to redistribute them.
 
 To request access:
 
@@ -24,7 +24,7 @@ To request access:
 
 The [CITeR dataset listing](https://github.com/CITeR-Research/Datasets-Liveness-Detection-Competition-Fingerprint-and-Iris) also identifies these datasets as available to researchers under a release agreement. Approval and response time are controlled by the providers.
 
-The signed agreement is not included because it contains identifying information. The aggregate result files support inspection and downstream calculations without distributing fingerprint photographs. Their inclusion does not grant rights to the underlying dataset or establish permission for other forms of data redistribution.
+The aggregate result files support inspection and downstream calculations without distributing fingerprint photographs. Their inclusion does not grant rights to the underlying dataset or establish permission for other forms of data redistribution.
 
 ## Environment
 
@@ -71,22 +71,8 @@ python python_codes/theoretical_k_attempt_curves.py
 | `intro_fig.py` | Illustrative Gaussian densities and FAR/FRR regions | `figs/fig_2continuous/` |
 | `uniform_graphs.py` | Uniform distributions, operating curves, and parameter sweeps | `figs/fig_uniform/` |
 | `parabolic_graphs.py` | Quadratic distributions and success/threshold comparisons | `figs/fig_parabola/` |
-| `1dis1con.py` | One discrete and one continuous credential | `figs/fig_1continuous_1discrete/` |
-| `2contcred_opt.py` | Two continuous Gaussian credentials | `figs/fig_2continuous/` |
-| `theoretical_k_attempt_curves.py` | Optimized repeated-attempt policies for three distribution families | `figs/fig_theoretical_k_attempts/` |
-
-Most parameters are constants in each script. The theoretical repeated-attempt script also provides command-line options:
-
-```sh
-python python_codes/theoretical_k_attempt_curves.py --help
-```
-
-For a smaller exploratory run (not the full reported experiment):
-
-```sh
-python python_codes/theoretical_k_attempt_curves.py \
-  --models uniform --max-k 2 --optimizer-starts 2 --de-maxiter 10
-```
+| `1dis1con.py` | One atomic and one biometric credential | `figs/fig_1continuous_1discrete/` |
+| `2contcred_opt.py` | Two Gaussian distributed biometric credentials | `figs/fig_2continuous/` |
 
 ## Route 2: reuse supplied aggregate results, without biometric images
 
@@ -189,8 +175,6 @@ After this full run, the Route 2 policy commands use the newly generated checkpo
 python python_codes/ks_histogram_test.py \
   figs/fig_spoofed_users/livdet_sourceafis_histogram_best_of_probes_data.txt
 ```
-
-The spoof script's `KS_*` constants contain previously fitted parameters; running the fitting script prints results but does not automatically update those constants. The Live-only scoring script intentionally disables its theoretical KS curves pending a fit to its histogram.
 
 ## Verification and limitations
 
